@@ -58,11 +58,31 @@ typedef struct Esp32BtState {
     qemu_irq irq_rwble;
 
     /*
-     * Synthetic baseband wakeup.  The real RWBT block raises an interrupt
-     * when the sleep timer programmed in 0x034 expires.  This model does not
-     * implement the timer unit, so it fires a configurable periodic wakeup
-     * after a sleep request in 0x030 bit 31.  See docs/09 for the caveat.
+     * Sleep/wakeup state machine for 0x030.
+     *
+     * The RWBT block raises two distinct interrupt status events during a
+     * sleep exit:
+     *   - status bit 2 -> r_rwip_wakeup()      (RWIP "wakeup": clock/RF on)
+     *   - status bit 0 -> r_rwip_wakeup_end()  (RWIP "wakeup end")
+     * r_rwip_wakeup() sets the RWIP prevent-sleep bit 0 that
+     * r_rwip_wakeup_end() requires, so the order matters: bit 2 must be
+     * delivered before bit 0.  The real block also reports the sleep state
+     * back in 0x030 bit 15, which btdm_wakeup_request() polls before it asks
+     * the baseband to wake up (0x030 bit 4).
+     *
+     * This model synthesizes those events from the sleep request (bit 31) and
+     * a programmable periodic sleep-timer expiry.  It is not silicon
+     * behaviour; see docs/09 and notes/q4g.md.
      */
-    QEMUTimer *wakeup_timer;
+    QEMUTimer *sleep_ack_timer;     /* sets 0x030 bit 15 (asleep) */
+    QEMUTimer *wakeup_timer;        /* sleep-timer expiry / periodic wake */
+    QEMUTimer *wakeup_start_timer;  /* raises RWBT status bit 2 */
+    QEMUTimer *wakeup_end_timer;    /* raises RWBT status bit 0 */
     uint64_t wakeup_interval_ns;
+    uint64_t sleep_ack_ns;
+    uint64_t wakeup_start_ns;
+    uint64_t wakeup_end_ns;
+    bool wake_in_progress;
+    bool wakeup_ack_seen;
+    bool wakeup_end_armed;
 } Esp32BtState;

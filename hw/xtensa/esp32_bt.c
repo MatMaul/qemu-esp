@@ -44,6 +44,27 @@
 #define RWBT_IRQ_ACK       0x064
 #define RWBT_SLEEP_REQUEST 0x80000000u
 
+/*
+ * 0x030 sleep/wakeup control and status bits (working names).
+ *
+ *   31   sleep request (software, r_rwbt_sleep_enter)
+ *   15   baseband asleep / sleep acknowledged (read by r_rw_schedule and
+ *        btdm_wakeup_request)
+ *   4    wakeup request (software, btdm_wakeup_request)
+ *   3    wakeup in progress (r_rwbt_sleep_wakeup)
+ *   0-2  RF sleep config (rf_rw_sleep)
+ */
+#define RWBT_SLEEP_STATE   0x00008000u
+#define RWBT_WAKEUP_REQ    0x00000010u
+
+/*
+ * RWBT interrupt status bits used by the sleep state machine:
+ *   bit 2 -> r_rwip_wakeup()      (via modules_funcs[0x170])
+ *   bit 0 -> r_rwip_wakeup_end()  (via modules_funcs[0x178])
+ */
+#define RWBT_IRQ_WAKEUP      0x00000004u
+#define RWBT_IRQ_WAKEUP_END  0x00000001u
+
 /* RWBLE register offsets (absolute 0x3ff71200 + n). */
 #define RWBLE_BASE         0x200
 #define RWBLE_CTRL         0x200
@@ -100,21 +121,105 @@ static void esp32_bt_update_irqs(Esp32BtState *s)
 }
 
 /*
- * Synthetic wakeup: the controller programs a sleep timer through 0x034 and
- * sets 0x030 bit 31.  The real hardware raises an IRQ when the timer expires;
- * this model raises the RWBT "wakeup end" status bit (bit 0) after a fixed
- * virtual delay so the controller leaves its idle loop and services HCI.
+ * Sleep/wakeup synthesis.
+ *
+ * Sequence:
+ *   1. software sets 0x030 bit 31 (r_rwbt_sleep_enter), and rf_rw_sleep()
+ *      ORs bits 0-2;
+ *   2. this model acknowledges the sleep by setting 0x030 bit 15 shortly
+ *      afterwards and arms the (synthetic) sleep timer;
+ *   3. on sleep-timer expiry, or when software sets the wakeup request
+ *      (0x030 bit 4, from btdm_wakeup_request), the wakeup is delivered as
+ *      two separate RWBT status events: bit 2 first (r_rwip_wakeup), then
+ *      bit 0 (r_rwip_wakeup_end).  The blob's r_rwip_wakeup_end only acts
+ *      when the RWIP prevent-sleep bit set by r_rwip_wakeup is present, so
+ *      raising bit 0 alone is a no-op.
  */
+static uint32_t *esp32_bt_sleep_ctrl(Esp32BtState *s)
+{
+    return &s->rwbt[RWBT_SLEEP_CTRL / 4];
+}
+
+static void esp32_bt_begin_wakeup(Esp32BtState *s)
+{
+    if (s->wake_in_progress) {
+        return;
+    }
+    s->wake_in_progress = true;
+    s->wakeup_ack_seen = false;
+    s->wakeup_end_armed = false;
+    timer_del(s->wakeup_timer);
+    timer_del(s->wakeup_end_timer);
+    timer_mod(s->wakeup_start_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->wakeup_start_ns);
+    qemu_log_mask(LOG_UNIMP, "esp32_bt: wakeup requested\n");
+}
+
+static void esp32_bt_sleep_ack(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+
+    *esp32_bt_sleep_ctrl(s) |= RWBT_SLEEP_STATE;
+    qemu_log_mask(LOG_UNIMP, "esp32_bt: sleep ack, 0x030 -> %08x\n",
+                  *esp32_bt_sleep_ctrl(s));
+
+    if (s->wakeup_interval_ns) {
+        timer_mod(s->wakeup_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  s->wakeup_interval_ns);
+    }
+}
+
 static void esp32_bt_wakeup_timer(void *opaque)
 {
     Esp32BtState *s = ESP32_BT(opaque);
 
-    /* The baseband clears the sleep request when the wakeup completes. */
-    s->rwbt[RWBT_SLEEP_CTRL / 4] &= ~RWBT_SLEEP_REQUEST;
-    s->rwbt_irq_status |= 0x1;
+    if (!(*esp32_bt_sleep_ctrl(s) & RWBT_SLEEP_STATE)) {
+        /* Not asleep: try again later rather than spinning. */
+        if (s->wakeup_interval_ns) {
+            timer_mod(s->wakeup_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      s->wakeup_interval_ns);
+        }
+        return;
+    }
+
+    qemu_log_mask(LOG_UNIMP, "esp32_bt: sleep timer expiry\n");
+    esp32_bt_begin_wakeup(s);
+}
+
+static void esp32_bt_wakeup_start(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+
+    s->wakeup_end_armed = false;
+    s->rwbt_irq_status |= RWBT_IRQ_WAKEUP;
     qemu_log_mask(LOG_UNIMP,
-                  "esp32_bt: synthetic RWBT wakeup, status=%08x\n",
+                  "esp32_bt: RWBT wakeup start, status=%08x\n",
                   s->rwbt_irq_status);
+    esp32_bt_update_irqs(s);
+    /*
+     * The "wakeup end" event is only raised after software has serviced
+     * and acknowledged the wakeup-start bit (0x018 write).  Raising it
+     * blindly tends to collapse into the same ISR invocation, and the ISR
+     * tests status bit 0 before bit 2, which turns r_rwip_wakeup_end() into
+     * a no-op and leaves the controller stuck in the wakeup state.
+     */
+}
+
+static void esp32_bt_wakeup_end(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t *ctrl = esp32_bt_sleep_ctrl(s);
+
+    s->wakeup_end_armed = false;
+    s->wakeup_ack_seen = false;
+    s->rwbt_irq_status |= RWBT_IRQ_WAKEUP_END;
+    *ctrl &= ~(RWBT_SLEEP_STATE | RWBT_WAKEUP_REQ);
+    s->wake_in_progress = false;
+    qemu_log_mask(LOG_UNIMP,
+                  "esp32_bt: RWBT wakeup end, status=%08x 0x030=%08x\n",
+                  s->rwbt_irq_status, *ctrl);
     esp32_bt_update_irqs(s);
 }
 
@@ -199,6 +304,33 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         s->rwbt_irq_status &= ~v;
         s->rwbt[off / 4] = v;
         esp32_bt_update_irqs(s);
+
+        /*
+         * Wakeup sequence handshake.
+         *
+         * The wakeup-start bit (2) is acknowledged with a 0x018 write.
+         * The blob then runs r_rwbt_sleep_wakeup(), which writes
+         * 0x018 = -1 (clear all) while still inside the same ISR, wiping any
+         * status bit raised meanwhile.  Therefore the "wakeup end" event is
+         * only raised after that last clear-all write, with a delay long
+         * enough for the ISR to return.  The acknowledge time is used as a
+         * fallback in case no clear-all write follows.
+         */
+        if ((v & RWBT_IRQ_WAKEUP) && s->wake_in_progress) {
+            s->wakeup_ack_seen = true;
+            if (!s->wakeup_end_armed) {
+                timer_mod(s->wakeup_end_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          20000000);
+            }
+        }
+        if (v == 0xffffffffu && s->wake_in_progress &&
+            s->wakeup_ack_seen) {
+            s->wakeup_end_armed = true;
+            timer_mod(s->wakeup_end_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      s->wakeup_end_ns);
+        }
         break;
     case RWBLE_IRQ_CLEAR:
         s->rwble_irq_status &= ~v;
@@ -215,14 +347,28 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     {
         uint32_t old = s->rwbt[off / 4];
 
-        s->rwbt[off / 4] = v;
-        if (!(old & RWBT_SLEEP_REQUEST) && (v & RWBT_SLEEP_REQUEST)) {
-            timer_mod(s->wakeup_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      s->wakeup_interval_ns);
-        } else if ((old & RWBT_SLEEP_REQUEST) &&
-                   !(v & RWBT_SLEEP_REQUEST)) {
+        /*
+         * Bit 15 is a baseband status bit, not a software field: preserve the
+         * modelled value across guest read-modify-writes and only let the
+         * sleep state machine change it.
+         */
+        v = (v & ~RWBT_SLEEP_STATE) | (old & RWBT_SLEEP_STATE);
+
+        if (!(old & RWBT_SLEEP_REQUEST) &&
+            (v & RWBT_SLEEP_REQUEST)) {
+            /* New sleep request: the baseband is no longer "asleep" yet. */
+            v &= ~RWBT_SLEEP_STATE;
             timer_del(s->wakeup_timer);
+            timer_mod(s->sleep_ack_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      s->sleep_ack_ns);
+            qemu_log_mask(LOG_UNIMP, "esp32_bt: sleep request\n");
+        }
+
+        s->rwbt[off / 4] = v;
+
+        if (!(old & RWBT_WAKEUP_REQ) && (v & RWBT_WAKEUP_REQ)) {
+            esp32_bt_begin_wakeup(s);
         }
         break;
     }
@@ -289,7 +435,13 @@ static void esp32_bt_reset(DeviceState *dev)
     s->rwble_irq_status = 0;
     s->rwbt_irq_enable = 0;
     s->rwble_irq_enable = 0;
+    s->wake_in_progress = false;
+    s->wakeup_ack_seen = false;
+    s->wakeup_end_armed = false;
+    timer_del(s->sleep_ack_timer);
     timer_del(s->wakeup_timer);
+    timer_del(s->wakeup_start_timer);
+    timer_del(s->wakeup_end_timer);
     esp32_bt_update_irqs(s);
 
     /*
@@ -316,8 +468,14 @@ static void esp32_bt_init(Object *obj)
 
     sysbus_init_irq(sbd, &s->irq_rwbt);
     sysbus_init_irq(sbd, &s->irq_rwble);
+    s->sleep_ack_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      esp32_bt_sleep_ack, s);
     s->wakeup_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    esp32_bt_wakeup_timer, s);
+    s->wakeup_start_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         esp32_bt_wakeup_start, s);
+    s->wakeup_end_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       esp32_bt_wakeup_end, s);
 }
 
 static void esp32_bt_class_init(ObjectClass *klass, void *data)
@@ -328,8 +486,21 @@ static void esp32_bt_class_init(ObjectClass *klass, void *data)
 }
 
 static Property esp32_bt_properties[] = {
+    /*
+     * Synthetic sleep-timer period.  The real block wakes up when the timer
+     * programmed through 0x034 expires; this model instead wakes periodically
+     * while 0x030 bit 15 (asleep) is set.  It is also the fallback that keeps
+     * the controller making progress if a wakeup request is missed.
+     */
     DEFINE_PROP_UINT64("wakeup-interval-ns", Esp32BtState,
                        wakeup_interval_ns, 1000000),
+    /* Delay from the sleep request to the modelled "asleep" status. */
+    DEFINE_PROP_UINT64("sleep-ack-ns", Esp32BtState, sleep_ack_ns, 1000),
+    /* Delay from a wakeup trigger to RWBT status bit 2 (r_rwip_wakeup). */
+    DEFINE_PROP_UINT64("wakeup-start-ns", Esp32BtState,
+                       wakeup_start_ns, 1000),
+    /* Delay from bit 2 to RWBT status bit 0 (r_rwip_wakeup_end). */
+    DEFINE_PROP_UINT64("wakeup-end-ns", Esp32BtState, wakeup_end_ns, 500000),
     DEFINE_PROP_END_OF_LIST(),
 };
 
