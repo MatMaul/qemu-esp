@@ -22,6 +22,7 @@
 #include "hw/misc/unimp.h"
 #include "hw/xtensa/unimp-default.h"
 #include "hw/irq.h"
+#include "hw/core/split-irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
 #include "hw/xtensa/esp32.h"
@@ -164,7 +165,9 @@ static void esp32_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->dport));
         device_cold_reset(DEVICE(&s->intmatrix));
         device_cold_reset(DEVICE(&s->aes));
+#ifdef CONFIG_GCRYPT
         device_cold_reset(DEVICE(&s->rsa));
+#endif
         device_cold_reset(DEVICE(&s->gpio));
         for (int i = 0; i < ESP32_UART_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->uart[i]));
@@ -394,14 +397,73 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->crosscore_int), index, target);
     }
 
+#ifdef CONFIG_GCRYPT
     qdev_realize(DEVICE(&s->rsa), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->rsa, DR_REG_RSA_BASE);
+#endif
 
     qdev_realize(DEVICE(&s->sha), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->sha, DR_REG_SHA_BASE);
 
     qdev_realize(DEVICE(&s->unknown), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device_prio(sys_mem, &s->unknown, 0x3ff00000, -1001);
+
+    /*
+     * Bluetooth register blocks.  The RWBT/RWBLE block lives in the address
+     * range that the WiFi code calls "chipv7_phy" (0x3ff71000); the BT
+     * baseband/RF control block is at 0x3ff51000.  Map both with a higher
+     * priority than the generic unimplemented-device stubs so accesses are
+     * traced instead of being silently swallowed.
+     */
+    qdev_realize(DEVICE(&s->bt), &s->periph_bus, &error_fatal);
+    {
+        MemoryRegion *mr_rwbt = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->bt), 0);
+        MemoryRegion *mr_bb = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->bt), 1);
+        MemoryRegion *mr;
+
+        memory_region_add_subregion_overlap(sys_mem, ESP32_BT_RWBT_BASE, mr_rwbt, 1);
+        mr = g_new(MemoryRegion, 1);
+        memory_region_init_alias(mr, OBJECT(&s->bt), "esp32.bt.rwbt-apb",
+                                 mr_rwbt, 0, ESP32_BT_RWBT_SIZE);
+        memory_region_add_subregion_overlap(sys_mem,
+            ESP32_BT_RWBT_BASE - DR_REG_DPORT_APB_BASE + APB_REG_BASE, mr, 1);
+
+        memory_region_add_subregion_overlap(sys_mem, ESP32_BT_BB_BASE, mr_bb, 1);
+        mr = g_new(MemoryRegion, 1);
+        memory_region_init_alias(mr, OBJECT(&s->bt), "esp32.bt.bb-apb",
+                                 mr_bb, 0, ESP32_BT_BB_SIZE);
+        memory_region_add_subregion_overlap(sys_mem,
+            ESP32_BT_BB_BASE - DR_REG_DPORT_APB_BASE + APB_REG_BASE, mr, 1);
+    }
+
+    /*
+     * Each BT interrupt line drives both the interrupt matrix (which routes it
+     * to a CPU interrupt) and the DPORT_PRO_INTR_STATUS_0 shadow used by the
+     * level-4 HLI dispatcher.  The split-irq device fans one source to both.
+     */
+    {
+        DeviceState *split;
+
+        split = qdev_new(TYPE_SPLIT_IRQ);
+        qdev_prop_set_uint16(split, "num-lines", 2);
+        qdev_realize_and_unref(split, NULL, &error_fatal);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->bt), 0,
+                           qdev_get_gpio_in(split, 0));
+        qdev_connect_gpio_out(split, 0,
+            qdev_get_gpio_in(intmatrix_dev, ETS_RWBT_INTR_SOURCE));
+        qdev_connect_gpio_out(split, 1,
+            qdev_get_gpio_in(DEVICE(&s->dport), ETS_RWBT_INTR_SOURCE));
+
+        split = qdev_new(TYPE_SPLIT_IRQ);
+        qdev_prop_set_uint16(split, "num-lines", 2);
+        qdev_realize_and_unref(split, NULL, &error_fatal);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->bt), 1,
+                           qdev_get_gpio_in(split, 0));
+        qdev_connect_gpio_out(split, 0,
+            qdev_get_gpio_in(intmatrix_dev, ETS_RWBLE_INTR_SOURCE));
+        qdev_connect_gpio_out(split, 1,
+            qdev_get_gpio_in(DEVICE(&s->dport), ETS_RWBLE_INTR_SOURCE));
+    }
 
     qdev_realize(DEVICE(&s->aes), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->aes, DR_REG_AES_BASE);
@@ -642,6 +704,8 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "unknown", &s->unknown, TYPE_ESP32_UNKNOWN);
 
+    object_initialize_child(obj, "bt", &s->bt, TYPE_ESP32_BT);
+
     object_initialize_child(obj, "ana", &s->ana, TYPE_ESP32_ANA);
 
     printf("nb_nics=%d\n", nb_nics);
@@ -662,7 +726,9 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "ledc", &s->ledc, TYPE_ESP32_LEDC);
 
+#ifdef CONFIG_GCRYPT
     object_initialize_child(obj, "rsa", &s->rsa, TYPE_ESP32_RSA);
+#endif
 
     object_initialize_child(obj, "efuse", &s->efuse, TYPE_ESP32_EFUSE);
 

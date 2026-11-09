@@ -59,6 +59,28 @@ static inline void set_mmu_entry(Esp32CacheRegionState* crs, hwaddr base, hwaddr
     }
 }
 
+/*
+ * DPORT_PRO_INTR_STATUS_0 is the level-4 (HLI) view of the peripheral
+ * interrupt lines.  The ESP32 interrupt matrix already carries one input per
+ * peripheral source, so the board wires the same lines here as well.  Only the
+ * bits used by the Bluetooth controller (ETS_RWBT_INTR_SOURCE = 6 and
+ * ETS_RWBLE_INTR_SOURCE = 7) are expected to toggle.
+ */
+static void esp32_dport_intr_status(void *opaque, int n, int level)
+{
+    Esp32DportState *s = ESP32_DPORT(opaque);
+
+    if (n < 0 || n >= 32) {
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP, "dport: intr_status[%d] = %d\n", n, level);
+    if (level) {
+        s->pro_intr_status[0] |= (1u << n);
+    } else {
+        s->pro_intr_status[0] &= ~(1u << n);
+    }
+}
+
 static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32DportState *s = ESP32_DPORT(opaque);
@@ -120,6 +142,35 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
         break;
     case APP_IRAM0_MMU_FIRST ... APP_IRAM0_MMU_LAST:
         r = get_mmu_entry(&s->cache_state[1].iram0, APP_IRAM0_MMU_FIRST, addr);
+        break;
+    case A_DPORT_PERIP_CLK_EN:
+        r = s->periph_clk_en;
+        break;
+    case A_DPORT_PERIP_RST_EN:
+        r = s->periph_rst_en;
+        break;
+    case A_DPORT_WIFI_CLK_EN:
+        r = s->wifi_clk_en;
+        break;
+    case A_DPORT_CORE_RST_EN:
+        r = s->core_rst_en;
+        break;
+    case A_DPORT_BT_LPCK_DIV_INT:
+        r = s->bt_lpck_div_int;
+        break;
+    case A_DPORT_BT_LPCK_DIV_FRAC:
+        r = s->bt_lpck_div_frac;
+        break;
+    case A_DPORT_PRO_INTR_STATUS_0:
+        r = s->pro_intr_status[0];
+        qemu_log_mask(LOG_UNIMP, "dport: PRO_INTR_STATUS_0 -> %08x\n",
+                      (uint32_t)r);
+        break;
+    case A_DPORT_PRO_INTR_STATUS_1:
+        r = s->pro_intr_status[1];
+        break;
+    case A_DPORT_PRO_INTR_STATUS_2:
+        r = s->pro_intr_status[2];
         break;
     case A_DPORT_SLAVE_SPI_CONFIG:
         r = s->slave_spi_config_reg;
@@ -225,6 +276,29 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
         break;
     case APP_IRAM0_MMU_FIRST ... APP_IRAM0_MMU_LAST:
         set_mmu_entry(&s->cache_state[1].iram0, APP_IRAM0_MMU_FIRST, addr, value);
+        break;
+    case A_DPORT_PERIP_CLK_EN:
+        s->periph_clk_en = value;
+        break;
+    case A_DPORT_PERIP_RST_EN:
+        s->periph_rst_en = value;
+        break;
+    case A_DPORT_WIFI_CLK_EN:
+        s->wifi_clk_en = value;
+        break;
+    case A_DPORT_CORE_RST_EN:
+        s->core_rst_en = value;
+        break;
+    case A_DPORT_BT_LPCK_DIV_INT:
+        s->bt_lpck_div_int = value;
+        break;
+    case A_DPORT_BT_LPCK_DIV_FRAC:
+        s->bt_lpck_div_frac = value;
+        break;
+    case A_DPORT_PRO_INTR_STATUS_0:
+    case A_DPORT_PRO_INTR_STATUS_1:
+    case A_DPORT_PRO_INTR_STATUS_2:
+        /* Read-only in hardware. */
         break;
     case A_DPORT_SLAVE_SPI_CONFIG:
         s->slave_spi_config_reg = value;
@@ -431,6 +505,8 @@ static void esp32_dport_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &esp32_dport_ops, s,
                           TYPE_ESP32_DPORT, ESP32_DPORT_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
+
+    qdev_init_gpio_in(DEVICE(s), esp32_dport_intr_status, 32);
 
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
         Esp32CacheState* cs = &s->cache_state[i];

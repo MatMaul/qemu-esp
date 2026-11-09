@@ -11,18 +11,14 @@
 #include "hw/boards.h"
 #include "hw/xtensa/esp32_unknown.h"
 #include "hw/xtensa/esp32_reg.h"
+#include "xtensa_trace_mmio.h"
 
 static uint64_t esp32_unknown_read(void *opaque, hwaddr addr, unsigned int size)
-{   
+{
     addr += 0x3ff00000;
     uint64_t r = 0;
-    switch (addr) {
-        default: {
-            printf("ERROR: unmapped peripheral read for %08x\n", (uint32_t) addr);
-            exit(1);
-            break;
-        }
-    }
+    qemu_log_mask(LOG_UNIMP, "esp32_unknown: read  %08x\n", (uint32_t) addr);
+    log_mmio_access(addr, 0, false);
     return r;
 }
 
@@ -30,8 +26,9 @@ static void esp32_unknown_write(void *opaque, hwaddr addr,
                        uint64_t value, unsigned int size)
 {
     addr += 0x3ff00000;
-    printf("ERROR: unmapped peripheral write for %08x, setting to %08x (size=%d)\n", (uint32_t) addr, (uint32_t) value, size);
-    exit(1);
+    qemu_log_mask(LOG_UNIMP, "esp32_unknown: write %08x <- %08x\n",
+                  (uint32_t) addr, (uint32_t) value);
+    log_mmio_access(addr, (uint32_t) value, true);
 }
 
 static const MemoryRegionOps esp32_unknown_ops = {

@@ -128,6 +128,16 @@ void HELPER(intset)(CPUXtensaState *env, uint32_t v)
 {
     qatomic_or(&env->sregs[INTSET],
               v & env->config->inttype_mask[INTTYPE_SOFTWARE]);
+
+    /*
+     * A write to INTSET can raise a CPU interrupt immediately.  Without this,
+     * software interrupts (used by ESP-IDF for VHCI host->controller wakeups)
+     * are only noticed at the next explicit check_interrupts site, which may
+     * never happen while the target task is halted.
+     */
+    qemu_mutex_lock_iothread();
+    check_interrupts(env);
+    qemu_mutex_unlock_iothread();
 }
 
 static void intclear(CPUXtensaState *env, uint32_t v)

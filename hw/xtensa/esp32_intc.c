@@ -17,26 +17,41 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/xtensa/esp32_intc.h"
+#include "hw/xtensa/esp32_reg.h"
 
 #define INTMATRIX_UNINT_VALUE   6
 
 #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
 
+static void esp32_intmatrix_update_cpu(Esp32IntMatrixState *s, int cpu)
+{
+    if (s->outputs[cpu] == NULL) {
+        return;
+    }
+    for (int int_index = 0;
+         int_index < s->cpu[cpu]->env.config->nextint; ++int_index) {
+        int out_index = s->cpu[cpu]->env.config->extint[int_index];
+        int level = 0;
+
+        for (int src = 0; src < ESP32_INT_MATRIX_INPUTS; ++src) {
+            if (s->irq_raw[src] && IRQ_MAP(cpu, src) == out_index) {
+                level = 1;
+                break;
+            }
+        }
+        qemu_set_irq(s->outputs[cpu][int_index], level);
+    }
+}
+
 static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
 {
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
     s->irq_raw[n] = level;
+    if (n == ETS_RWBT_INTR_SOURCE || n == ETS_RWBLE_INTR_SOURCE) {
+        qemu_log_mask(LOG_UNIMP, "intmatrix: source %d level %d\n", n, level);
+    }
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
-        if (s->outputs[i] == NULL) {
-            continue;
-        }
-        int out_index = IRQ_MAP(i, n);
-        for (int int_index = 0; int_index < s->cpu[i]->env.config->nextint; ++int_index) {
-            if (s->cpu[i]->env.config->extint[int_index] == out_index) {
-                qemu_set_irq(s->outputs[i][int_index], level);
-                break;
-            }
-        }
+        esp32_intmatrix_update_cpu(s, i);
     }
 }
 
@@ -64,18 +79,24 @@ static void esp32_intmatrix_write(void* opaque, hwaddr addr, uint64_t value, uns
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
     int source_index = (addr / sizeof(uint32_t)) % ESP32_INT_MATRIX_INPUTS;
     uint8_t *map_entry = get_map_entry(s, addr);
-    if (value == INTMATRIX_UNINT_VALUE) {
-        int si = s->irq_raw[source_index];
-        esp32_intmatrix_irq_handler(s, source_index, 0);
-        s->irq_raw[source_index] = si;
+    if (source_index == ETS_RWBT_INTR_SOURCE ||
+        source_index == ETS_RWBLE_INTR_SOURCE) {
+        qemu_log_mask(LOG_UNIMP, "intmatrix: map source %d (cpu %d) <- %d\n",
+                      source_index, source_index / ESP32_INT_MATRIX_INPUTS,
+                      (int)value);
     }
     if (map_entry != NULL) {
         *map_entry = value & 0x1f;
     }
-    if (value != INTMATRIX_UNINT_VALUE && s->irq_raw[source_index]) {
-        esp32_intmatrix_irq_handler(s, source_index, 1);
+    /*
+     * Several peripheral sources may be routed to the same CPU interrupt.
+     * Recompute each output as the OR of all currently asserted sources;
+     * otherwise one source deasserting would clear a line still driven by
+     * another source (this is how RWBT and RWBLE share CPU interrupt 25).
+     */
+    for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
+        esp32_intmatrix_update_cpu(s, i);
     }
-
 }
 
 static const MemoryRegionOps esp_intmatrix_ops = {

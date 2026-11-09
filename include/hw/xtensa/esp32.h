@@ -14,6 +14,7 @@
 #include "hw/xtensa/esp32_ledc.h"
 #include "hw/xtensa/esp32_rsa.h"
 #include "hw/xtensa/esp32_unknown.h"
+#include "hw/xtensa/esp32_bt.h"
 #include "hw/xtensa/esp32_ana.h"
 #include "hw/xtensa/esp32_wifi.h"
 #include "hw/xtensa/esp32_phya.h"
@@ -52,6 +53,7 @@ typedef struct Esp32SocState {
     Esp32EfuseState efuse;
     Esp32FlashEncryptionState flash_enc;
     Esp32UnknownState unknown;
+    Esp32BtState bt;
     Esp32AnaState ana;
     Esp32WifiState wifi;
     Esp32PhyaState phya;

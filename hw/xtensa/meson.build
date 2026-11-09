@@ -23,6 +23,7 @@ xtensa_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_ledc.c',
   'esp32_flash_enc.c',
   'esp32_unknown.c',
+  'esp32_bt.c',
   'esp32_wifi.c',
   'esp32_wifi_ap.c',
   'esp32_wlan_packet.c',

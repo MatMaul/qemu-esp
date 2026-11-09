@@ -74,6 +74,13 @@ typedef struct Esp32DportState {
     uint32_t cpuperiod_sel;
     uint32_t cache_ill_trap_en_reg;
     uint32_t slave_spi_config_reg;
+    uint32_t bt_lpck_div_int;
+    uint32_t bt_lpck_div_frac;
+    uint32_t periph_clk_en;
+    uint32_t periph_rst_en;
+    uint32_t wifi_clk_en;
+    uint32_t core_rst_en;
+    uint32_t pro_intr_status[3];
 
 } Esp32DportState;
 
@@ -122,6 +129,16 @@ REG32(DPORT_APP_CACHE_CTRL1, 0x5C)
     FIELD(DPORT_APP_CACHE_CTRL1, MASK_IROM0, 2, 1)
     FIELD(DPORT_APP_CACHE_CTRL1, MASK_IRAM1, 1, 1)
     FIELD(DPORT_APP_CACHE_CTRL1, MASK_IRAM0, 0, 1)
+
+REG32(DPORT_PERIP_CLK_EN, 0xC0)
+REG32(DPORT_PERIP_RST_EN, 0xC4)
+REG32(DPORT_WIFI_CLK_EN, 0xCC)
+REG32(DPORT_CORE_RST_EN, 0xD0)
+REG32(DPORT_BT_LPCK_DIV_INT, 0xD4)
+REG32(DPORT_BT_LPCK_DIV_FRAC, 0xD8)
+REG32(DPORT_PRO_INTR_STATUS_0, 0xEC)
+REG32(DPORT_PRO_INTR_STATUS_1, 0xF0)
+REG32(DPORT_PRO_INTR_STATUS_2, 0xF4)
 
 REG32(DPORT_SLAVE_SPI_CONFIG, 0xC8)
     FIELD(DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_ENCRYPT_ENABLE, 8, 1)
