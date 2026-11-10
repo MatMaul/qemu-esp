@@ -79,6 +79,14 @@
 #define RWBLE_STATUS       0x260
 
 /*
+ * Default RWBLE probe trigger: 0x2a0 is written once by r_lld_adv_start when
+ * advertising is programmed (baseline: "RWBLE write 02a0 <- 000005dc" just
+ * before "BLE: Advertising started").  The probe is disabled unless
+ * rwble-probe-bit is set, so this default has no side effect.
+ */
+#define RWBLE_PROBE_TRIGGER_ADV 0x2a0
+
+/*
  * Both RWBT_CTRL and RWBLE_CTRL use bits 31/30 as self-clearing
  * reset/handshake bits:
  *
@@ -118,6 +126,65 @@ static void esp32_bt_update_irqs(Esp32BtState *s)
      */
     qemu_set_irq(s->irq_rwbt, s->rwbt_irq_status != 0);
     qemu_set_irq(s->irq_rwble, s->rwble_irq_status != 0);
+}
+
+/*
+ * Opt-in RWBLE status-bit probe (docs/11 Q4e).
+ *
+ * These functions are inert unless the user selected a bit with the
+ * rwble-probe-bit device property (0..31).  The probe raises exactly one bit
+ * in RWBLE_IRQ_STATUS (0x210) so that r_rwble_isr() dispatches it.
+ * It does not synthesise any accompanying baseband event; some handlers may
+ * therefore read stale EM state.  This is a diagnostic injection only.
+ */
+static void esp32_bt_rwble_probe_fire(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t mask;
+
+    s->rwble_probe_armed = false;
+    if (s->rwble_probe_bit >= 32 || s->rwble_probe_fired) {
+        return;
+    }
+
+    s->rwble_probe_fired = true;
+    mask = 1u << s->rwble_probe_bit;
+    s->rwble_irq_status |= mask;
+    qemu_log_mask(LOG_UNIMP,
+                  "esp32_bt: RWBLE probe inject bit %u mask=%08x "
+                  "status=%08x\n",
+                  s->rwble_probe_bit, mask, s->rwble_irq_status);
+    esp32_bt_update_irqs(s);
+}
+
+static void esp32_bt_rwble_probe_arm(Esp32BtState *s, uint64_t delay_ns)
+{
+    if (s->rwble_probe_bit >= 32 || s->rwble_probe_fired ||
+        s->rwble_probe_armed) {
+        return;
+    }
+
+    s->rwble_probe_armed = true;
+    timer_mod(s->rwble_probe_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+    qemu_log_mask(LOG_UNIMP,
+                  "esp32_bt: RWBLE probe armed: bit %u delay=%" PRIu64
+                  " ns\n",
+                  s->rwble_probe_bit, delay_ns);
+}
+
+/*
+ * Arm the "delay from boot" variant on the first RWBT/RWBLE access.  The
+ * device reset hook may run before qdev applies -global properties, so it
+ * cannot reliably arm this timer itself; the first guest access always comes
+ * after property setup.  esp32_bt_rwble_probe_arm() is idempotent, so this is
+ * harmless when reset already armed it.
+ */
+static void esp32_bt_rwble_probe_arm_start(Esp32BtState *s)
+{
+    if (s->rwble_probe_start_ns > 0) {
+        esp32_bt_rwble_probe_arm(s, s->rwble_probe_start_ns);
+    }
 }
 
 /*
@@ -229,6 +296,8 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
     uint32_t r;
     uint32_t off = addr & ~3u;
 
+    esp32_bt_rwble_probe_arm_start(s);
+
     switch (off) {
     case RWBT_CTRL:
     case RWBLE_CTRL:
@@ -285,6 +354,8 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     Esp32BtState *s = ESP32_BT(opaque);
     uint32_t off = addr & ~3u;
     uint32_t v = (uint32_t)value;
+
+    esp32_bt_rwble_probe_arm_start(s);
 
     switch (off) {
     case RWBT_CTRL:
@@ -384,6 +455,17 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     qemu_log_mask(LOG_UNIMP, "esp32_bt: %s write %04x <- %08x\n",
                   esp32_bt_block(off), (uint32_t)off, v);
     log_mmio_access(ESP32_BT_RWBT_BASE + off, v, true);
+
+    /*
+     * Arm the opt-in RWBLE probe on the selected RWBLE register write.
+     * Disabled by default (rwble_probe_bit == 0xffffffff).  When
+     * rwble-probe-start-ns is set, the reset-time timer is used instead and
+     * this register trigger is ignored.
+     */
+    if (s->rwble_probe_bit < 32 && s->rwble_probe_start_ns == 0 &&
+        off >= RWBLE_BASE && off == s->rwble_probe_trigger_off) {
+        esp32_bt_rwble_probe_arm(s, s->rwble_probe_delay_ns);
+    }
 }
 
 static uint64_t esp32_bt_bb_read(void *opaque, hwaddr addr, unsigned int size)
@@ -442,7 +524,15 @@ static void esp32_bt_reset(DeviceState *dev)
     timer_del(s->wakeup_timer);
     timer_del(s->wakeup_start_timer);
     timer_del(s->wakeup_end_timer);
+    timer_del(s->rwble_probe_timer);
+    s->rwble_probe_armed = false;
+    s->rwble_probe_fired = false;
     esp32_bt_update_irqs(s);
+
+    /* Best-effort reset-time arm; the first guest access arms it otherwise. */
+    if (s->rwble_probe_bit < 32 && s->rwble_probe_start_ns > 0) {
+        esp32_bt_rwble_probe_arm(s, s->rwble_probe_start_ns);
+    }
 
     /*
      * RWBT version/current-RX-descriptor-pointer register.  The ROM
@@ -476,6 +566,8 @@ static void esp32_bt_init(Object *obj)
                                          esp32_bt_wakeup_start, s);
     s->wakeup_end_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        esp32_bt_wakeup_end, s);
+    s->rwble_probe_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        esp32_bt_rwble_probe_fire, s);
 }
 
 static void esp32_bt_class_init(ObjectClass *klass, void *data)
@@ -501,6 +593,26 @@ static Property esp32_bt_properties[] = {
                        wakeup_start_ns, 1000),
     /* Delay from bit 2 to RWBT status bit 0 (r_rwip_wakeup_end). */
     DEFINE_PROP_UINT64("wakeup-end-ns", Esp32BtState, wakeup_end_ns, 500000),
+
+    /*
+     * Opt-in RWBLE status-bit probe (docs/11 Q4e).  Disabled by default
+     * (rwble-probe-bit = 0xffffffff).  Set it to a bit index 0..31 to raise
+     * that one bit in RWBLE_IRQ_STATUS (0x210) and let r_rwble_isr()
+     * dispatch it.  The trigger is a guest write to the RWBLE register at
+     * rwble-probe-trigger-off (default 0x2a0, written by r_lld_adv_start
+     * when advertising is programmed); rwble-probe-start-ns > 0 instead
+     * arms the probe from the first RWBT/RWBLE access (approximately boot)
+     * and ignores the register trigger.  rwble-probe-delay-ns is applied
+     * after the trigger.
+     */
+    DEFINE_PROP_UINT32("rwble-probe-bit", Esp32BtState,
+                       rwble_probe_bit, 0xffffffffu),
+    DEFINE_PROP_UINT32("rwble-probe-trigger-off", Esp32BtState,
+                       rwble_probe_trigger_off, RWBLE_PROBE_TRIGGER_ADV),
+    DEFINE_PROP_UINT64("rwble-probe-delay-ns", Esp32BtState,
+                       rwble_probe_delay_ns, 1000000),
+    DEFINE_PROP_UINT64("rwble-probe-start-ns", Esp32BtState,
+                       rwble_probe_start_ns, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 

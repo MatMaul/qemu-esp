@@ -85,4 +85,22 @@ typedef struct Esp32BtState {
     bool wake_in_progress;
     bool wakeup_ack_seen;
     bool wakeup_end_armed;
+
+    /*
+     * Opt-in RWBLE status-bit probe (docs/11 Q4e).  Disabled by default: the
+     * default property value selects no bit, so the model behaves exactly as
+     * before.  When enabled it raises ONE bit in RWBLE_IRQ_STATUS (0x210)
+     * either after a chosen RWBLE register write (default 0x2a0, the
+     * advertising-config write in r_lld_adv_start) or after a virtual delay
+     * from the first RWBT/RWBLE access (approximately boot).  The guest's
+     * RWBLE handler then dispatches it; the point is to observe which ROM
+     * handler runs, not to emulate a real event.
+     */
+    uint32_t rwble_probe_bit;         /* bit index; 0xffffffff disables */
+    uint32_t rwble_probe_trigger_off; /* RWBLE offset whose write arms it */
+    uint64_t rwble_probe_delay_ns;    /* delay from the trigger write */
+    uint64_t rwble_probe_start_ns;    /* >0: arm from reset instead */
+    bool rwble_probe_armed;
+    bool rwble_probe_fired;
+    QEMUTimer *rwble_probe_timer;
 } Esp32BtState;
