@@ -103,4 +103,41 @@ typedef struct Esp32BtState {
     bool rwble_probe_armed;
     bool rwble_probe_fired;
     QEMUTimer *rwble_probe_timer;
+
+    /*
+     * Opt-in baseband RX descriptor model (iteration 4).  Disabled by default.
+     *
+     * When enabled, a guest write that raises the selected bit (default bit
+     * 10 of RWBT 0x00c, the inquiry-activity bit set by r_ld_fm_prog_push)
+     * arms a one-shot timer.  On expiry the model fills the
+     * descriptor currently named by RWBT 0x02c (bt_et_currentrxdescptr),
+     * advances 0x02c to the next ring entry and raises the selected RWBT
+     * status bit.  This models the owner/complete half of the RX ring that
+     * the CPU-only EM tracer cannot see.  The payload contents are synthetic
+     * and no on-air behaviour is implied.
+     */
+    bool bb_rx_inject;
+    uint32_t bb_rx_trigger_off;
+    uint32_t bb_rx_trigger_bit;
+    uint64_t bb_rx_delay_ns;
+    uint32_t bb_rx_activity;
+    uint32_t bb_rx_packet_type;
+    uint32_t bb_rx_payload_len;
+    uint32_t bb_rx_status_low;
+    uint32_t bb_rx_status_bit;
+    bool bb_rx_armed;
+    bool bb_rx_fired;
+    QEMUTimer *bb_rx_timer;
+
+    /*
+     * Optional synthetic EA fine-timer ticks (RWBT status bit 9).  The real
+     * baseband raises bit 9 when the event/fine timer expires; that is what
+     * lets the controller's scheduler run the inquiry event-start callback
+     * and push the frame-manager program.  Disabled by default and bounded to
+     * a small number of ticks so it remains an opt-in probe.
+     */
+    bool bb_ea_inject;
+    uint64_t bb_ea_interval_ns;
+    uint32_t bb_ea_ticks;
+    QEMUTimer *bb_ea_timer;
 } Esp32BtState;

@@ -22,6 +22,8 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "exec/address-spaces.h"
+#include "exec/memory.h"
 #include "hw/hw.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
@@ -33,7 +35,8 @@
 #define RWBT_VERSION_RXPTR 0x004
 #define RWBT_IRQ_STATUS    0x010
 #define RWBT_IRQ_CLEAR     0x018
-#define RWBT_WAKEUP_BOUND  0x01c
+#define RWBT_INT_MASK      0x00c
+#define RWBT_CLK_UPD       0x01c
 #define RWBT_SLEEP_CTRL    0x030
 #define RWBT_SLEEP_TIMER   0x034
 #define RWBT_CLK_LO        0x038
@@ -85,6 +88,36 @@
  * rwble-probe-bit is set, so this default has no side effect.
  */
 #define RWBLE_PROBE_TRIGGER_ADV 0x2a0
+
+/*
+ * Opt-in baseband RX descriptor model (iteration 4).
+ *
+ * The BR/EDR hardware RX ring is four 14-byte descriptors at EM 0x2382,
+ * 0x2390, 0x239e and 0x23ac (docs/04 §3.1/§3.3).  RWBT 0x02c bits 14:0 name
+ * the descriptor the baseband currently owns.  The real hardware fills the
+ * descriptor, advances 0x02c and raises an RWBT status bit; that write order
+ * is not observable from the CPU side, so this model synthesises one frame.
+ *
+ * Trigger: a guest write to RWBT 0x00c that raises bit 10 (0x400).  The
+ * inquiry start path writes 0x3cc02 (the baseline 0x3c802 plus bit 10) just
+ * before it pushes the inquiry frame-manager program.  The default status bit
+ * is RWBT status bit 1, which r_rwbt_isr() dispatches to r_ld_fm_rx_isr()
+ * (docs/03 §2.3).  Every value below is a QEMU property so another activity
+ * can be modelled without editing the device.
+ */
+#define RWBT_CURRENT_RXDESC 0x02c
+#define RWBT_RXDESC_BASE     0x2382u
+#define RWBT_RXDESC_LAST     0x23acu
+#define RWBT_RXDESC_STRIDE   0x0eu
+#define RWBT_RX_TRIGGER_OFF  0x00c
+#define RWBT_RX_TRIGGER_BIT  10   /* inquiry activity bit (0x3cc02) */
+#define RWBT_RX_STATUS_BIT   1
+#define RWBT_EA_STATUS_BIT   9
+#define RWBT_EA_MAX_TICKS    400
+
+/* The BB block exposes the exchange-memory base at 0x0a0 (docs/03 §3). */
+#define ESP32_BT_BB_EM_BASE  0x0a0
+#define RWBT_EM_BASE_DEFAULT 0x3ffb0000u
 
 /*
  * Both RWBT_CTRL and RWBLE_CTRL use bits 31/30 as self-clearing
@@ -185,6 +218,192 @@ static void esp32_bt_rwble_probe_arm_start(Esp32BtState *s)
     if (s->rwble_probe_start_ns > 0) {
         esp32_bt_rwble_probe_arm(s, s->rwble_probe_start_ns);
     }
+}
+
+/*
+ * Baseband RX descriptor model.
+ *
+ * EM is ordinary DRAM at the CPU's virtual/physical address, so the device
+ * reaches it through address_space_memory.  The base is taken from the BB EM
+ * base register when the guest has programmed it; otherwise the ESP32 default
+ * is used.  These helpers are only called from the opt-in timer path.
+ */
+static uint32_t esp32_bt_em_base(Esp32BtState *s)
+{
+    uint32_t base = s->bb[ESP32_BT_BB_EM_BASE / 4];
+
+    if (base == 0 || (base & 0xfu) != 0) {
+        return RWBT_EM_BASE_DEFAULT;
+    }
+    return base;
+}
+
+static uint16_t esp32_bt_em_read16(Esp32BtState *s, uint32_t off)
+{
+    uint16_t v = 0;
+
+    address_space_read(&address_space_memory,
+                       esp32_bt_em_base(s) + off,
+                       MEMTXATTRS_UNSPECIFIED, &v, sizeof(v));
+    return v;
+}
+
+static void esp32_bt_em_write16(Esp32BtState *s, uint32_t off, uint16_t v)
+{
+    address_space_write(&address_space_memory,
+                        esp32_bt_em_base(s) + off,
+                        MEMTXATTRS_UNSPECIFIED, &v, sizeof(v));
+}
+
+static void esp32_bt_em_write8(Esp32BtState *s, uint32_t off, uint8_t v)
+{
+    address_space_write(&address_space_memory,
+                        esp32_bt_em_base(s) + off,
+                        MEMTXATTRS_UNSPECIFIED, &v, sizeof(v));
+}
+
+/*
+ * Synthetic inquiry/FHS payload.  The values are deliberately recognisable in
+ * the trace and in the guest's HCI event; they are not a real peer's FHS.
+ */
+static const uint8_t esp32_bt_rx_pattern[40] = {
+    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,   /* BD_ADDR */
+    0x01,                                 /* page-scan repetition mode */
+    0x00,                                 /* reserved */
+    0x02, 0x03, 0x04,                     /* class of device */
+    0x05, 0x06,                           /* clock offset */
+    0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+    0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+    0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+    0x19, 0x1a,
+};
+
+static bool esp32_bt_rxdesc_valid(uint32_t off)
+{
+    return off >= RWBT_RXDESC_BASE && off <= RWBT_RXDESC_LAST &&
+           ((off - RWBT_RXDESC_BASE) % RWBT_RXDESC_STRIDE) == 0;
+}
+
+static void esp32_bt_rx_frame_inject(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t desc, next, payload_off, staging_off;
+    uint32_t i, len;
+    uint16_t act_word;
+
+    s->bb_rx_armed = false;
+    if (!s->bb_rx_inject || s->bb_rx_fired) {
+        return;
+    }
+    s->bb_rx_fired = true;
+    timer_del(s->bb_ea_timer);
+
+    desc = s->rwbt[RWBT_CURRENT_RXDESC / 4] & 0x7fffu;
+    if (!esp32_bt_rxdesc_valid(desc)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "esp32_bt: RX inject skipped: current desc %04x "
+                      "is outside the 0x2382 ring\n", desc);
+        return;
+    }
+
+    /*
+     * Follow the ring's own next pointer.  r_ld_reset()/r_ld_init() wrote
+     * each descriptor's bits 14:0 to the next EM offset, so this also
+     * demonstrates that the model consumes the software-built ring rather
+     * than a hard-coded sequence.
+     */
+    next = esp32_bt_em_read16(s, desc) & 0x7fffu;
+    if (!esp32_bt_rxdesc_valid(next)) {
+        next = desc == RWBT_RXDESC_LAST ?
+               RWBT_RXDESC_BASE : desc + RWBT_RXDESC_STRIDE;
+    }
+
+    payload_off = esp32_bt_em_read16(s, desc + 0x0a);
+    staging_off = esp32_bt_em_read16(s, desc + 0x0c);
+    len = MIN(s->bb_rx_payload_len, sizeof(esp32_bt_rx_pattern));
+
+    /*
+     * DMA order: payload first, then the descriptor words, then the owner
+     * pointer, then the status bit.  The guest callback only observes the
+     * final state, but the trace records this order for the claim.
+     */
+    for (i = 0; i < len; i++) {
+        esp32_bt_em_write8(s, payload_off + i, esp32_bt_rx_pattern[i]);
+    }
+    for (i = 0; i < 20; i++) {
+        esp32_bt_em_write8(s, staging_off + i,
+                           i < len ? esp32_bt_rx_pattern[i] : 0);
+    }
+
+    act_word = (uint16_t)(((s->bb_rx_activity & 0x1fu) << 11) |
+                          (s->bb_rx_status_low & 0x7ffu));
+    esp32_bt_em_write16(s, desc + 0x00, (uint16_t)(next | 0x8000u));
+    esp32_bt_em_write16(s, desc + 0x02, act_word);
+    esp32_bt_em_write16(s, desc + 0x04,
+                        (uint16_t)((s->bb_rx_packet_type & 0x0fu) << 3));
+    esp32_bt_em_write16(s, desc + 0x06, (uint16_t)((len & 0xffu) << 3));
+    esp32_bt_em_write16(s, desc + 0x08, 0);
+
+    s->rwbt[RWBT_CURRENT_RXDESC / 4] = next;
+    s->rwbt_irq_status |= 1u << (s->bb_rx_status_bit & 31u);
+
+    qemu_log_mask(LOG_UNIMP,
+                  "esp32_bt: RX frame inject desc=%04x next=%04x "
+                  "activity=%u type=%u len=%u payload=%04x staging=%04x "
+                  "status=%08x clock=%u\n",
+                  desc, next, s->bb_rx_activity, s->bb_rx_packet_type,
+                  len, payload_off, staging_off, s->rwbt_irq_status,
+                  esp32_bt_bt_clk());
+    esp32_bt_update_irqs(s);
+}
+
+/*
+ * Synthetic EA fine-timer tick.  r_rwbt_isr() dispatches RWBT status bit 9
+ * to r_ea_finetimer_isr(), which advances the controller's event scheduler.
+ * Without a baseband, the inquiry event-start callback never runs and the
+ * frame-manager program is never pushed.  The ticks are bounded and opt-in.
+ */
+static void esp32_bt_ea_tick(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+
+    if (!s->bb_ea_inject || s->bb_rx_fired ||
+        s->bb_ea_ticks >= RWBT_EA_MAX_TICKS) {
+        return;
+    }
+    s->bb_ea_ticks++;
+    s->rwbt_irq_status |= 1u << RWBT_EA_STATUS_BIT;
+    qemu_log_mask(LOG_UNIMP,
+                  "esp32_bt: EA tick %u, status=%08x\n",
+                  s->bb_ea_ticks, s->rwbt_irq_status);
+    esp32_bt_update_irqs(s);
+    timer_mod(s->bb_ea_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              s->bb_ea_interval_ns);
+}
+
+static void esp32_bt_ea_start(Esp32BtState *s)
+{
+    if (!s->bb_ea_inject || s->bb_ea_ticks != 0) {
+        return;
+    }
+    timer_mod(s->bb_ea_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              s->bb_ea_interval_ns);
+}
+
+static void esp32_bt_rx_inject_arm(Esp32BtState *s)
+{
+    if (!s->bb_rx_inject || s->bb_rx_fired || s->bb_rx_armed) {
+        return;
+    }
+    s->bb_rx_armed = true;
+    esp32_bt_ea_start(s);
+    timer_mod(s->bb_rx_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->bb_rx_delay_ns);
+    qemu_log_mask(LOG_UNIMP,
+                  "esp32_bt: RX inject armed (delay=%" PRIu64 " ns, clock=%u)\n",
+                  s->bb_rx_delay_ns, esp32_bt_bt_clk());
 }
 
 /*
@@ -323,10 +542,31 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
     case RWBT_IRQ_STATUS:
         r = s->rwbt_irq_status;
         break;
+    case RWBT_INT_MASK:
+        /*
+         * Bits 9/10 are the bt_intcntl fine-target / ke-timer interrupt
+         * masks.  The ROM's ea_prog_timer() asserts that the fine-target
+         * mask is set when the target it is asked to program is already due
+         * (ea.c:497).  With a host-time virtual clock the emulated scheduling
+         * path can cross the target before ea_prog_timer() runs, so the model
+         * reports the fine-target mask as enabled (hardware-owned).
+         */
+        r = s->rwbt[off / 4] | 0x200u;
+        break;
     case RWBLE_IRQ_STATUS:
         r = s->rwble_irq_status;
         break;
-    case RWBT_WAKEUP_BOUND:
+    case RWBT_CLK_UPD:
+        /*
+         * r_ld_read_clock() reads this register, ORs bit 31 (clock-update
+         * command), writes it back, polls until bit 31 clears, then reads
+         * again.  The low 31 bits are the hardware-owned native clock, so a
+         * write must not overwrite them.  Returning 0 here stalls the EA
+         * scheduler: every event stays in the future and the frame-manager
+         * program is never pushed (docs/03 §2.1).
+         */
+        r = esp32_bt_bt_clk() & 0x7fffffffu;
+        break;
     case RWBLE_WAKEUP_BOUND:
         r = s->rwbt[off / 4] & ~BT_WAKEUP_SELF_CLEAR;
         break;
@@ -354,6 +594,7 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     Esp32BtState *s = ESP32_BT(opaque);
     uint32_t off = addr & ~3u;
     uint32_t v = (uint32_t)value;
+    uint32_t prev = s->rwbt[off / 4];
 
     esp32_bt_rwble_probe_arm_start(s);
 
@@ -443,7 +684,9 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         }
         break;
     }
-    case RWBT_WAKEUP_BOUND:
+    case RWBT_CLK_UPD:
+        /* Clock-update command: hardware-owned and self-clearing. */
+        break;
     case RWBLE_WAKEUP_BOUND:
         s->rwbt[off / 4] = v & ~BT_WAKEUP_SELF_CLEAR;
         break;
@@ -465,6 +708,19 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     if (s->rwble_probe_bit < 32 && s->rwble_probe_start_ns == 0 &&
         off >= RWBLE_BASE && off == s->rwble_probe_trigger_off) {
         esp32_bt_rwble_probe_arm(s, s->rwble_probe_delay_ns);
+    }
+
+    /*
+     * Opt-in baseband RX model: arm on the selected register's bit-0 0->1
+     * transition.  The frame-manager enable path writes 0x00c values such as
+     * 0x05 just after programming the inquiry/ACL activity.
+     */
+    if (off == s->bb_rx_trigger_off && s->bb_rx_trigger_bit < 32) {
+        uint32_t bit = 1u << s->bb_rx_trigger_bit;
+
+        if ((v & bit) != 0 && (prev & bit) == 0) {
+            esp32_bt_rx_inject_arm(s);
+        }
     }
 }
 
@@ -527,6 +783,11 @@ static void esp32_bt_reset(DeviceState *dev)
     timer_del(s->rwble_probe_timer);
     s->rwble_probe_armed = false;
     s->rwble_probe_fired = false;
+    timer_del(s->bb_rx_timer);
+    s->bb_rx_armed = false;
+    s->bb_rx_fired = false;
+    timer_del(s->bb_ea_timer);
+    s->bb_ea_ticks = 0;
     esp32_bt_update_irqs(s);
 
     /* Best-effort reset-time arm; the first guest access arms it otherwise. */
@@ -568,6 +829,10 @@ static void esp32_bt_init(Object *obj)
                                        esp32_bt_wakeup_end, s);
     s->rwble_probe_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                         esp32_bt_rwble_probe_fire, s);
+    s->bb_rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  esp32_bt_rx_frame_inject, s);
+    s->bb_ea_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  esp32_bt_ea_tick, s);
 }
 
 static void esp32_bt_class_init(ObjectClass *klass, void *data)
@@ -613,6 +878,34 @@ static Property esp32_bt_properties[] = {
                        rwble_probe_delay_ns, 1000000),
     DEFINE_PROP_UINT64("rwble-probe-start-ns", Esp32BtState,
                        rwble_probe_start_ns, 0),
+
+    /*
+     * Opt-in baseband RX descriptor model (iteration 4).  Disabled by default:
+     * without -global driver=misc.esp32.bt,property=bb-rx-inject,value=on the
+     * device behaves exactly as before.  bb-rx-trigger-off selects the RWBT
+     * register whose bit 0 0->1 transition arms the one-shot injection;
+     * bb-rx-delay-ns lets the guest finish programming the activity first.
+     */
+    DEFINE_PROP_BOOL("bb-rx-inject", Esp32BtState, bb_rx_inject, false),
+    DEFINE_PROP_UINT32("bb-rx-trigger-off", Esp32BtState,
+                       bb_rx_trigger_off, RWBT_RX_TRIGGER_OFF),
+    DEFINE_PROP_UINT32("bb-rx-trigger-bit", Esp32BtState,
+                       bb_rx_trigger_bit, RWBT_RX_TRIGGER_BIT),
+    DEFINE_PROP_UINT64("bb-rx-delay-ns", Esp32BtState,
+                       bb_rx_delay_ns, 10000000),
+    DEFINE_PROP_UINT32("bb-rx-activity", Esp32BtState,
+                       bb_rx_activity, 7),
+    DEFINE_PROP_UINT32("bb-rx-packet-type", Esp32BtState,
+                       bb_rx_packet_type, 2),
+    DEFINE_PROP_UINT32("bb-rx-payload-len", Esp32BtState,
+                       bb_rx_payload_len, 13),
+    DEFINE_PROP_UINT32("bb-rx-status-low", Esp32BtState,
+                       bb_rx_status_low, 0),
+    DEFINE_PROP_UINT32("bb-rx-status-bit", Esp32BtState,
+                       bb_rx_status_bit, RWBT_RX_STATUS_BIT),
+    DEFINE_PROP_BOOL("bb-ea-inject", Esp32BtState, bb_ea_inject, false),
+    DEFINE_PROP_UINT64("bb-ea-interval-ns", Esp32BtState,
+                       bb_ea_interval_ns, 1000000),
     DEFINE_PROP_END_OF_LIST(),
 };
 
