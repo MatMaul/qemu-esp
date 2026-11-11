@@ -114,6 +114,7 @@
 #define RWBT_RX_TRIGGER_BIT  10   /* inquiry activity bit (0x3cc02) */
 #define RWBT_RX_STATUS_BIT   1
 #define RWBT_EA_STATUS_BIT   9
+#define RWBT_SW_STATUS_BIT   16
 #define RWBT_EA_MAX_TICKS    400
 
 /*
@@ -167,10 +168,30 @@
     } \
 } while (0)
 
-static uint32_t esp32_bt_bt_clk(void)
+static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
 {
     /* BR/EDR and BLE native clock: one tick is 312.5 us. */
-    return (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 312500);
+    uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t clk = now_ns / 312500;
+
+    /*
+     * r_ea_finetimer_isr only runs the EA element whose programmed target
+     * equals the half-slot clock it reads (a3 == a5 at 0x4001571c).  Real
+     * hardware raises the fine-timer interrupt inside the target slot, so the
+     * read-back clock is still the target.  A host-time clock keeps advancing
+     * between the model's fire and the guest's read, which would make the
+     * comparison miss by one and drop the event.  Hold the clock at the fired
+     * target for a short latency window (well under one 625 us slot) so
+     * r_ea_finetimer_isr sees the slot it was woken for.  This is a model
+     * consistency aid, not a timing claim.
+     */
+    if (now_ns < s->clock_hold_until) {
+        return s->clock_floor;
+    }
+    if (clk < s->clock_floor) {
+        clk = s->clock_floor;
+    }
+    return (uint32_t)clk;
 }
 
 static const char *esp32_bt_block(uint32_t off)
@@ -249,6 +270,12 @@ static void esp32_bt_rwble_probe_arm_start(Esp32BtState *s)
     if (s->rwble_probe_start_ns > 0) {
         esp32_bt_rwble_probe_arm(s, s->rwble_probe_start_ns);
     }
+    if (s->bb_sw_inject && !s->bb_sw_armed) {
+        s->bb_sw_armed = true;
+        timer_mod(s->bb_sw_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  s->bb_sw_interval_ns);
+    }
 }
 
 /*
@@ -279,6 +306,15 @@ static uint16_t esp32_bt_em_read16(Esp32BtState *s, uint32_t off)
     return v;
 }
 
+static uint32_t esp32_bt_read32(uint32_t addr)
+{
+    uint32_t v = 0;
+
+    address_space_read(&address_space_memory, addr,
+                       MEMTXATTRS_UNSPECIFIED, &v, sizeof(v));
+    return v;
+}
+
 static void esp32_bt_em_write16(Esp32BtState *s, uint32_t off, uint16_t v)
 {
     address_space_write(&address_space_memory,
@@ -294,19 +330,36 @@ static void esp32_bt_em_write8(Esp32BtState *s, uint32_t off, uint8_t v)
 }
 
 /*
- * Synthetic inquiry/FHS payload.  The values are deliberately recognisable in
+ * Synthetic inquiry/FHS record.  The values are deliberately recognisable in
  * the trace and in the guest's HCI event; they are not a real peer's FHS.
+ *
+ * The controller does not parse the raw on-air bit stream here: ROM
+ * r_ld_util_fhs_unpk (0x40040e54) unpacks the 20-byte record that the
+ * descriptor's +0x0c field points at, with a byte-aligned layout (verified
+ * from the disassembly and from the emitted Inquiry Result):
+ *
+ *   +0x04  u32   bits 2..25  = LAP (the LAP is stored shifted left by two)
+ *   +0x07        bits 5..4   = page-scan repetition mode
+ *   +0x08  u8    UAP
+ *   +0x09  u16   NAP
+ *   +0x0b  u24   Class of Device
+ *   +0x0e  u32   bits 2..0 = LT_ADDR, bits 28..3 = CLK27-2
+ *
+ * The values below encode BD_ADDR 06:05:04:03:02:01 (HCI byte order
+ * 01 02 03 04 05 06) and Class of Device 0x007a020c, a valid format-type-1
+ * phone COD.  The bt_discovery app cancels the inquiry after the first
+ * result for a phone/AV device, which exercises the HCI_Inquiry_Cancel /
+ * Command Complete path.
+ * 18 bytes is the FHS payload size in bytes (144 bits).
  */
-static const uint8_t esp32_bt_rx_pattern[40] = {
-    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,   /* BD_ADDR */
-    0x01,                                 /* page-scan repetition mode */
-    0x00,                                 /* reserved */
-    0x02, 0x03, 0x04,                     /* class of device */
-    0x05, 0x06,                           /* clock offset */
-    0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
-    0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
-    0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-    0x19, 0x1a,
+static const uint8_t esp32_bt_rx_pattern[20] = {
+    0x00, 0x00, 0x00, 0x00,               /* +0x00: record word 0 */
+    0x04, 0x08, 0x0c, 0x00,               /* +0x04: LAP 0x030201 << 2 */
+    0x04,                                 /* +0x08: UAP */
+    0x05, 0x06,                           /* +0x09: NAP */
+    0x0c, 0x02, 0x7a,                     /* +0x0b: COD 0x007a020c */
+    0x00, 0x00, 0x00, 0x00,               /* +0x0e: LT_ADDR + CLK27-2 */
+    0x00,                                 /* +0x12: pad */
 };
 
 static bool esp32_bt_rxdesc_valid(uint32_t off)
@@ -373,18 +426,23 @@ static void esp32_bt_rx_frame_inject(void *opaque)
     esp32_bt_em_write16(s, desc + 0x04,
                         (uint16_t)((s->bb_rx_packet_type & 0x0fu) << 3));
     esp32_bt_em_write16(s, desc + 0x06, (uint16_t)((len & 0xffu) << 3));
-    esp32_bt_em_write16(s, desc + 0x08, 0);
+    /*
+     * +0x08: r_ld_inq_frm_cbk copies its low byte to the result record, which
+     * r_modules_funcs_p+0xc4 emits as the Inquiry Result with RSSI byte.
+     */
+    esp32_bt_em_write16(s, desc + 0x08, (uint16_t)(s->bb_rx_rssi & 0xffu));
 
     s->rwbt[RWBT_CURRENT_RXDESC / 4] = next;
     s->rwbt_irq_status |= 1u << (s->bb_rx_status_bit & 31u);
 
     ESP32_BT_LOG(s,
                   "esp32_bt: RX frame inject desc=%04x next=%04x "
-                  "activity=%u type=%u len=%u payload=%04x staging=%04x "
-                  "status=%08x clock=%u\n",
+                  "activity=%u type=%u len=%u rssi=%u payload=%04x "
+                  "staging=%04x fmq=%08x status=%08x clock=%u\n",
                   desc, next, s->bb_rx_activity, s->bb_rx_packet_type,
-                  len, payload_off, staging_off, s->rwbt_irq_status,
-                  esp32_bt_bt_clk());
+                  len, s->bb_rx_rssi & 0xffu, payload_off, staging_off,
+                  esp32_bt_read32(0x3ffb8298), s->rwbt_irq_status,
+                  esp32_bt_bt_clk(s));
     esp32_bt_update_irqs(s);
 }
 
@@ -413,6 +471,29 @@ static void esp32_bt_ea_tick(void *opaque)
               s->bb_ea_interval_ns);
 }
 
+/*
+ * Optional periodic software-interrupt tick (RWBT status bit 16).
+ * r_rwbt_isr dispatches bit 16 to r_ip_funcs_p+0xfc (r_ea_sw_isr), which walks
+ * the software EA list.  This is a diagnostic probe for checking whether a
+ * frame-manager program is run through that path; it is off by default.
+ */
+static void esp32_bt_sw_tick(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+
+    if (!s->bb_sw_inject) {
+        return;
+    }
+    s->rwbt_irq_status |= 1u << RWBT_SW_STATUS_BIT;
+    ESP32_BT_LOG(s, "esp32_bt: SW tick n=%u status=%08x\n",
+                  s->bb_sw_ticks, s->rwbt_irq_status);
+    s->bb_sw_ticks++;
+    esp32_bt_update_irqs(s);
+    timer_mod(s->bb_sw_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              s->bb_sw_interval_ns);
+}
+
 static void esp32_bt_ea_start(Esp32BtState *s)
 {
     if (!s->bb_ea_inject || s->bb_ea_ticks != 0) {
@@ -434,9 +515,9 @@ static void esp32_bt_ea_start(Esp32BtState *s)
  * advance and the inquiry event-start callback can push the frame-manager
  * program.  The payload/air behaviour is still not modelled.
  */
-static uint32_t esp32_bt_ea_now_slot(void)
+static uint32_t esp32_bt_ea_now_slot(Esp32BtState *s)
 {
-    uint32_t raw = esp32_bt_bt_clk() & ESP32_BT_EA_TIME_MASK;
+    uint32_t raw = esp32_bt_bt_clk(s) & ESP32_BT_EA_TIME_MASK;
 
     /* r_ea_time_get_halfslot_rounded(): ((raw & 0x0fffffff) + 1) >> 1. */
     return ((raw + 1) >> 1) & ESP32_BT_EA_WRAP_MASK;
@@ -453,12 +534,21 @@ static void esp32_bt_ea_fire(void *opaque)
     s->ea_status_pending = true;
     s->ea_target_valid = false;  /* consumed by this expiry */
     s->ea_fires++;
+    {
+        uint64_t target_ticks = (uint64_t)s->ea_target * 2u;
+
+        if (target_ticks > s->clock_floor) {
+            s->clock_floor = target_ticks;
+        }
+        s->clock_hold_until =
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200000;
+    }
     s->rwbt_irq_status |= 1u << RWBT_EA_STATUS_BIT;
     ESP32_BT_LOG(s,
                   "esp32_bt: EA fine fire n=%u target=%08x now=%08x "
                   "status=%08x clock=%u\n",
-                  s->ea_fires, s->ea_target, esp32_bt_ea_now_slot(),
-                  s->rwbt_irq_status, esp32_bt_bt_clk());
+                  s->ea_fires, s->ea_target, esp32_bt_ea_now_slot(s),
+                  s->rwbt_irq_status, esp32_bt_bt_clk(s));
     esp32_bt_update_irqs(s);
 }
 
@@ -476,7 +566,7 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
         return;
     }
 
-    now_slot = esp32_bt_ea_now_slot();
+    now_slot = esp32_bt_ea_now_slot(s);
     delta = (s->ea_target - now_slot) & ESP32_BT_EA_WRAP_MASK;
     if (delta == 0 || delta > ESP32_BT_EA_HALF_RANGE) {
         /*
@@ -497,7 +587,7 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
                       "esp32_bt: EA fine armed target=%08x now=%08x "
                       "delta=%u delay=%" PRIu64 "ns clock=%u\n",
                       s->ea_target, now_slot, delta, delay_ns,
-                      esp32_bt_bt_clk());
+                      esp32_bt_bt_clk(s));
     }
     s->ea_armed = true;
 }
@@ -563,7 +653,7 @@ static void esp32_bt_rx_watch_poll(void *opaque)
                                   "esp32_bt: RX watch gated addr=%08x "
                                   "value=%08x ea_fires=%u clock=%u\n",
                                   s->bb_rx_watch_addr, v, s->ea_fires,
-                                  esp32_bt_bt_clk());
+                                  esp32_bt_bt_clk(s));
                 } else if (s->ea_fires > s->bb_rx_watch_fires) {
                     s->bb_rx_watch_armed = false;
                     s->bb_rx_watch_done = true;
@@ -573,7 +663,7 @@ static void esp32_bt_rx_watch_poll(void *opaque)
                                   "clock=%u\n",
                                   s->bb_rx_watch_addr, v,
                                   s->bb_rx_watch_offset, s->ea_fires,
-                                  esp32_bt_bt_clk());
+                                  esp32_bt_bt_clk(s));
                     esp32_bt_rx_inject_arm(s);
                     return;
                 }
@@ -584,7 +674,7 @@ static void esp32_bt_rx_watch_poll(void *opaque)
                               "esp32_bt: RX watch fired addr=%08x "
                               "value=%08x offset=%08x clock=%u\n",
                               s->bb_rx_watch_addr, v, s->bb_rx_watch_offset,
-                              esp32_bt_bt_clk());
+                              esp32_bt_bt_clk(s));
                 esp32_bt_rx_inject_arm(s);
                 return;
             }
@@ -607,7 +697,7 @@ static void esp32_bt_rx_watch_arm_start(Esp32BtState *s)
                   "esp32_bt: RX watch armed addr=%08x poll=%" PRIu64
                   "ns clock=%u\n",
                   s->bb_rx_watch_addr, s->bb_rx_watch_poll_ns,
-                  esp32_bt_bt_clk());
+                  esp32_bt_bt_clk(s));
     esp32_bt_rx_watch_poll(s);
 }
 
@@ -622,7 +712,7 @@ static void esp32_bt_rx_inject_arm(Esp32BtState *s)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->bb_rx_delay_ns);
     ESP32_BT_LOG(s,
                   "esp32_bt: RX inject armed (delay=%" PRIu64 " ns, clock=%u)\n",
-                  s->bb_rx_delay_ns, esp32_bt_bt_clk());
+                  s->bb_rx_delay_ns, esp32_bt_bt_clk(s));
 }
 
 /*
@@ -792,14 +882,14 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
          * scheduler: every event stays in the future and the frame-manager
          * program is never pushed (docs/03 §2.1).
          */
-        r = esp32_bt_bt_clk() & 0x7fffffffu;
+        r = esp32_bt_bt_clk(s) & 0x7fffffffu;
         break;
     case RWBLE_WAKEUP_BOUND:
         r = s->rwbt[off / 4] & ~BT_WAKEUP_SELF_CLEAR;
         break;
     case RWBT_CLK_LO:
     case RWBLE_CLK_LO:
-        r = esp32_bt_bt_clk();
+        r = esp32_bt_bt_clk(s);
         break;
     case RWBLE_CLK_HI:
         r = 0;
@@ -1040,6 +1130,9 @@ static void esp32_bt_reset(DeviceState *dev)
     s->bb_rx_fired = false;
     timer_del(s->bb_ea_timer);
     s->bb_ea_ticks = 0;
+    timer_del(s->bb_sw_timer);
+    s->bb_sw_armed = false;
+    s->bb_sw_ticks = 0;
     timer_del(s->bb_fine_timer);
     s->ea_target = 0;
     s->ea_target_valid = false;
@@ -1047,6 +1140,8 @@ static void esp32_bt_reset(DeviceState *dev)
     s->ea_status_pending = false;
     s->ea_armed = false;
     s->ea_fires = 0;
+    s->clock_floor = 0;
+    s->clock_hold_until = 0;
     timer_del(s->bb_rx_watch_timer);
     s->bb_rx_watch_armed = false;
     s->bb_rx_watch_gated = false;
@@ -1097,6 +1192,8 @@ static void esp32_bt_init(Object *obj)
                                   esp32_bt_rx_frame_inject, s);
     s->bb_ea_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                   esp32_bt_ea_tick, s);
+    s->bb_sw_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  esp32_bt_sw_tick, s);
     s->bb_fine_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                     esp32_bt_ea_fire, s);
     s->bb_rx_watch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
@@ -1169,12 +1266,17 @@ static Property esp32_bt_properties[] = {
     DEFINE_PROP_UINT32("bb-rx-packet-type", Esp32BtState,
                        bb_rx_packet_type, 2),
     DEFINE_PROP_UINT32("bb-rx-payload-len", Esp32BtState,
-                       bb_rx_payload_len, 13),
+                       bb_rx_payload_len, 18),
+    DEFINE_PROP_UINT32("bb-rx-rssi", Esp32BtState,
+                       bb_rx_rssi, 0),
     DEFINE_PROP_UINT32("bb-rx-status-low", Esp32BtState,
                        bb_rx_status_low, 0),
     DEFINE_PROP_UINT32("bb-rx-status-bit", Esp32BtState,
                        bb_rx_status_bit, RWBT_RX_STATUS_BIT),
     DEFINE_PROP_BOOL("bb-ea-inject", Esp32BtState, bb_ea_inject, false),
+    DEFINE_PROP_BOOL("bb-sw-inject", Esp32BtState, bb_sw_inject, false),
+    DEFINE_PROP_UINT64("bb-sw-interval-ns", Esp32BtState,
+                       bb_sw_interval_ns, 10000000),
     DEFINE_PROP_UINT64("bb-ea-interval-ns", Esp32BtState,
                        bb_ea_interval_ns, 1000000),
 

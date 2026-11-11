@@ -110,14 +110,16 @@ typedef struct Esp32BtState {
     /*
      * Opt-in baseband RX descriptor model (iteration 4).  Disabled by default.
      *
-     * When enabled, a guest write that raises the selected bit (default bit
-     * 10 of RWBT 0x00c, the inquiry-activity bit set by r_ld_fm_prog_push)
-     * arms a one-shot timer.  On expiry the model fills the
-     * descriptor currently named by RWBT 0x02c (bt_et_currentrxdescptr),
-     * advances 0x02c to the next ring entry and raises the selected RWBT
-     * status bit.  This models the owner/complete half of the RX ring that
-     * the CPU-only EM tracer cannot see.  The payload contents are synthetic
-     * and no on-air behaviour is implied.
+     * When enabled, a guest write that raises the selected bit (the inquiry
+     * generator uses bit 12 of RWBT 0x024, written by ld_inq_evt_start_cbk)
+     * arms a one-shot timer.  On expiry the model fills the descriptor
+     * currently named by RWBT 0x02c (bt_et_currentrxdescptr), advances 0x02c
+     * to the next ring entry and raises the selected RWBT status bit.  This
+     * models the owner/complete half of the RX ring that the CPU-only EM
+     * tracer cannot see.  bb_rx_payload_len is 18 by default (FHS = 144 bits)
+     * and bb_rx_rssi is written to descriptor +0x08, which ld_inq_frm_cbk
+     * emits as the HCI RSSI byte.  The payload contents are synthetic and no
+     * on-air behaviour is implied (see docs/09 §3.8).
      */
     bool bb_rx_inject;
     uint32_t bb_rx_trigger_off;
@@ -126,6 +128,7 @@ typedef struct Esp32BtState {
     uint32_t bb_rx_activity;
     uint32_t bb_rx_packet_type;
     uint32_t bb_rx_payload_len;
+    uint32_t bb_rx_rssi;
     uint32_t bb_rx_status_low;
     uint32_t bb_rx_status_bit;
     bool bb_rx_armed;
@@ -145,6 +148,19 @@ typedef struct Esp32BtState {
     QEMUTimer *bb_ea_timer;
 
     /*
+     * Optional periodic RWBT status bit 16 tick (iteration 6).  r_rwbt_isr
+     * dispatches bit 16 to r_ea_sw_isr, which walks the software EA list; in
+     * the inquiry model that is the reliable path that advances the
+     * frame-manager program and runs ld_inq_evt_start_cbk.  The cadence is a
+     * model ordering aid, not a claim about the real software-interrupt rate.
+     */
+    bool bb_sw_inject;
+    bool bb_sw_armed;
+    uint32_t bb_sw_ticks;
+    uint64_t bb_sw_interval_ns;
+    QEMUTimer *bb_sw_timer;
+
+    /*
      * Opt-in hardware fine-timer model (iteration 5).  Disabled by default.
      *
      * The controller's event arbiter (ROM ea_prog_timer / r_ea_finetimer_isr)
@@ -153,9 +169,14 @@ typedef struct Esp32BtState {
      * when the native clock reaches that target.  This model tracks the two
      * software writes, schedules a QEMU timer in the same 625 us slot unit the
      * ROM uses, and raises status bit 9 on expiry.  The guest acknowledges it
-     * with a 0x018 = 0x200 write.  This is model evidence, not silicon.
+     * with a 0x018 = 0x200 write.  Because r_ea_finetimer_isr only runs the
+     * element whose target equals the clock it reads, the model pins the
+     * reported clock to the fired target for a short window
+     * (clock_floor/clock_hold_until).  This is model evidence, not silicon.
      */
     bool bb_ea_model;
+    uint32_t clock_floor;       /* native-clock ticks already consumed by fires */
+    uint64_t clock_hold_until;  /* pin the clock to clock_floor until this ns */
     uint32_t ea_target;         /* last value written to RWBT 0x0b8 */
     bool ea_target_valid;       /* a target has been programmed */
     bool ea_mask_enabled;       /* 0x00c bit 9, as seen by the ROM */
