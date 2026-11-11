@@ -58,7 +58,7 @@ typedef struct Esp32BtState {
     bool bt_trace;
 
     /*
-     * Opt-in VHCI capture (iteration 7).  `vhci-env` is the guest address of
+     * Opt-in VHCI capture.  `vhci-env` is the guest address of
      * the `vhci_env_p` pointer.  The model samples the host-to-controller and
      * controller-to-host buffers on BT register activity and logs one line per
      * distinct packet, so a session can capture HCI bytes without a gdb
@@ -69,7 +69,7 @@ typedef struct Esp32BtState {
     uint32_t vhci_tx_key;
 
     /*
-     * Opt-in deterministic model clock (iteration 7).
+     * Opt-in deterministic model clock.
      *
      * `bt-clock=model` advances a model timebase from guest-visible BT
      * activity instead of QEMU_CLOCK_VIRTUAL, which tracks host wall time.
@@ -128,7 +128,7 @@ typedef struct Esp32BtState {
     bool wakeup_end_armed;
 
     /*
-     * Opt-in RWBLE status-bit probe (docs/11 Q4e).  Disabled by default: the
+     * Opt-in RWBLE status-bit probe (parent project Q4e).  Disabled by default: the
      * default property value selects no bit, so the model behaves exactly as
      * before.  When enabled it raises ONE bit in RWBLE_IRQ_STATUS (0x210)
      * either after a chosen RWBLE register write (default 0x2a0, the
@@ -146,7 +146,7 @@ typedef struct Esp32BtState {
     QEMUTimer *rwble_probe_timer;
 
     /*
-     * Opt-in baseband RX descriptor model (iteration 4).  Disabled by default.
+     * Opt-in baseband RX descriptor model.  Disabled by default.
      *
      * When enabled, a guest write that raises the selected bit (the inquiry
      * generator uses bit 12 of RWBT 0x024, written by ld_inq_evt_start_cbk)
@@ -187,7 +187,7 @@ typedef struct Esp32BtState {
     QEMUTimer *bb_ea_timer;
 
     /*
-     * Optional periodic RWBT status bit 16 tick (iteration 6).  r_rwbt_isr
+     * Optional periodic RWBT status bit 16 tick.  r_rwbt_isr
      * dispatches bit 16 to r_ea_sw_isr, which walks the software EA list; in
      * the inquiry model that is the reliable path that advances the
      * frame-manager program and runs ld_inq_evt_start_cbk.  The cadence is a
@@ -200,7 +200,7 @@ typedef struct Esp32BtState {
     QEMUTimer *bb_sw_timer;
 
     /*
-     * Opt-in hardware fine-timer model (iteration 5).  Disabled by default.
+     * Opt-in hardware fine-timer model.  Disabled by default.
      *
      * The controller's event arbiter (ROM ea_prog_timer / r_ea_finetimer_isr)
      * programs an absolute target in RWBT 0x0b8 and enables the fine-target
@@ -225,7 +225,7 @@ typedef struct Esp32BtState {
     QEMUTimer *bb_fine_timer;
 
     /*
-     * Opt-in state-based RX injection trigger (iteration 5).  When
+     * Opt-in state-based RX injection trigger.  When
      * bb-rx-watch-addr is non-zero the model polls that guest address and arms
      * the one-shot frame injection only after it becomes non-zero.  The
      * rx-model generator points this at ld_fm_env+0x14 (0x3ffb8298), the frame

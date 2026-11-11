@@ -90,7 +90,7 @@
 #define RWBLE_PROBE_TRIGGER_ADV 0x2a0
 
 /*
- * Opt-in baseband RX descriptor model (iteration 4).
+ * Opt-in baseband RX descriptor model.
  *
  * The BR/EDR hardware RX ring is four 14-byte descriptors at EM 0x2382,
  * 0x2390, 0x239e and 0x23ac (docs/04 §3.1/§3.3).  RWBT 0x02c bits 14:0 name
@@ -169,7 +169,7 @@
 } while (0)
 
 /*
- * Deterministic model clock (iteration 7).
+ * Deterministic model clock.
  *
  * `bt-clock=model` replaces QEMU_CLOCK_VIRTUAL with a timebase advanced by
  * guest-visible BT register activity.  Every modelled timer has a deadline in
@@ -296,7 +296,7 @@ static void esp32_bt_update_irqs(Esp32BtState *s)
 }
 
 /*
- * Opt-in RWBLE status-bit probe (docs/11 Q4e).
+ * Opt-in RWBLE status-bit probe (parent project Q4e).
  *
  * These functions are inert unless the user selected a bit with the
  * rwble-probe-bit device property (0..31).  The probe raises exactly one bit
@@ -596,7 +596,7 @@ static void esp32_bt_ea_start(Esp32BtState *s)
 }
 
 /*
- * Hardware fine-timer model (iteration 5).
+ * Hardware fine-timer model.
  *
  * The ROM programs an absolute slot-unit target in RWBT 0x0b8 and enables the
  * fine-target interrupt mask (0x00c bit 9).  The hardware compares it with the
@@ -682,7 +682,7 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
 }
 
 /*
- * State-based RX injection trigger (iteration 5).
+ * State-based RX injection trigger.
  *
  * Poll a guest address and arm the one-shot frame injection only after the
  * value becomes non-zero.  The rx-model generator points this at
@@ -1681,7 +1681,7 @@ static Property esp32_bt_properties[] = {
     DEFINE_PROP_BOOL("bt-trace", Esp32BtState, bt_trace, false),
 
     /*
-     * Opt-in deterministic model clock (iteration 7).  `host` (default) keeps
+     * Opt-in deterministic model clock.  `host` (default) keeps
      * the historical QEMU_CLOCK_VIRTUAL timing.  `model` advances a model
      * timebase on every BT register access and processes due events from it,
      * so tracing or gdb cannot change the event order.  bt-clock-step-ns is
@@ -1713,7 +1713,7 @@ static Property esp32_bt_properties[] = {
     DEFINE_PROP_UINT64("wakeup-end-ns", Esp32BtState, wakeup_end_ns, 500000),
 
     /*
-     * Opt-in RWBLE status-bit probe (docs/11 Q4e).  Disabled by default
+     * Opt-in RWBLE status-bit probe (parent project Q4e).  Disabled by default
      * (rwble-probe-bit = 0xffffffff).  Set it to a bit index 0..31 to raise
      * that one bit in RWBLE_IRQ_STATUS (0x210) and let r_rwble_isr()
      * dispatch it.  The trigger is a guest write to the RWBLE register at
@@ -1733,7 +1733,7 @@ static Property esp32_bt_properties[] = {
                        rwble_probe_start_ns, 0),
 
     /*
-     * Opt-in baseband RX descriptor model (iteration 4).  Disabled by default:
+     * Opt-in baseband RX descriptor model.  Disabled by default:
      * without -global driver=misc.esp32.bt,property=bb-rx-inject,value=on the
      * device behaves exactly as before.  bb-rx-trigger-off selects the RWBT
      * register whose bit 0 0->1 transition arms the one-shot injection;
@@ -1766,14 +1766,14 @@ static Property esp32_bt_properties[] = {
                        bb_ea_interval_ns, 1000000),
 
     /*
-     * Opt-in hardware fine-timer model (iteration 5).  Disabled by default.
+     * Opt-in hardware fine-timer model.  Disabled by default.
      * Tracks RWBT 0x0b8 and 0x00c bit 9 and raises RWBT status bit 9 when the
      * 625 us slot target is reached; see docs/09 §3.8.
      */
     DEFINE_PROP_BOOL("bb-ea-timer", Esp32BtState, bb_ea_model, false),
 
     /*
-     * Opt-in state-based RX trigger (iteration 5).  When bb-rx-watch-addr is
+     * Opt-in state-based RX trigger.  When bb-rx-watch-addr is
      * non-zero the one-shot frame injection is armed only after that 32-bit
      * guest word becomes non-zero.  The rx-model generator uses 0x3ffb8298
      * (ld_fm_env+0x14, the frame-manager program queue).

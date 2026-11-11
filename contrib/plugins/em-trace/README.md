@@ -28,7 +28,7 @@ make
 
 ## Run
 
-Copy the firmware image to `/tmp` inside the same command (Track C may replace
+Copy the firmware image to `/tmp` inside the same command (another capture pass may replace
 the harness image) and always bound the run:
 
 ```sh
