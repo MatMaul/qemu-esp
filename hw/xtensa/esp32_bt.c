@@ -168,10 +168,92 @@
     } \
 } while (0)
 
+/*
+ * Deterministic model clock (iteration 7).
+ *
+ * `bt-clock=model` replaces QEMU_CLOCK_VIRTUAL with a timebase advanced by
+ * guest-visible BT register activity.  Every modelled timer has a deadline in
+ * this timebase and is fired synchronously from esp32_bt_model_advance(); no
+ * QEMU timer is armed in model mode.  The host clock remains the default.
+ */
+enum {
+    /* Priority order matters only when two deadlines are exactly equal. */
+    ESP32_BT_TMR_EA_FINE = 0,
+    ESP32_BT_TMR_RX_INJECT,
+    ESP32_BT_TMR_SW_TICK,
+    ESP32_BT_TMR_EA_TICK,
+    ESP32_BT_TMR_RX_WATCH,
+    ESP32_BT_TMR_SLEEP_ACK,
+    ESP32_BT_TMR_WAKEUP,
+    ESP32_BT_TMR_WAKEUP_START,
+    ESP32_BT_TMR_WAKEUP_END,
+    ESP32_BT_TMR_RWBLE_PROBE,
+    ESP32_BT_TMR_COUNT,
+};
+
+static bool esp32_bt_model_clock(Esp32BtState *s)
+{
+    return s->bt_clock && strcmp(s->bt_clock, "model") == 0;
+}
+
+static bool esp32_bt_model_boot_start(Esp32BtState *s)
+{
+    return s->bt_clock_start && strcmp(s->bt_clock_start, "boot") == 0;
+}
+
+static uint64_t esp32_bt_guest_instructions(void)
+{
+    uint64_t count = 0;
+
+    for (int i = 0; i < 16; i++) {
+        count += qemu_guest_instruction_count[i];
+    }
+    return count;
+}
+
+static uint64_t esp32_bt_now_ns(Esp32BtState *s)
+{
+    if (esp32_bt_model_clock(s) && s->model_started) {
+        uint64_t count = esp32_bt_guest_instructions();
+
+        if (count < s->model_base_count) {
+            count = s->model_base_count;
+        }
+        return s->model_base_ns +
+               (count - s->model_base_count) *
+               (s->bt_clock_step_ns ? s->bt_clock_step_ns : 1);
+    }
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static void esp32_bt_sched(Esp32BtState *s, int id, QEMUTimer *timer,
+                           uint64_t delay_ns)
+{
+    if (esp32_bt_model_clock(s) && s->model_started) {
+        s->model_deadline[id] = s->model_ns + delay_ns;
+        s->model_active[id] = true;
+    } else {
+        timer_mod(timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+    }
+}
+
+static void esp32_bt_cancel(Esp32BtState *s, int id, QEMUTimer *timer)
+{
+    if (esp32_bt_model_clock(s) && s->model_started) {
+        s->model_active[id] = false;
+    } else {
+        timer_del(timer);
+    }
+}
+
+static void esp32_bt_model_advance(Esp32BtState *s);
+static void esp32_bt_model_anchor(Esp32BtState *s, const char *why);
+static Esp32BtState *esp32_bt_plugin_state;
+
 static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
 {
     /* BR/EDR and BLE native clock: one tick is 312.5 us. */
-    uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t now_ns = esp32_bt_now_ns(s);
     uint64_t clk = now_ns / 312500;
 
     /*
@@ -250,8 +332,8 @@ static void esp32_bt_rwble_probe_arm(Esp32BtState *s, uint64_t delay_ns)
     }
 
     s->rwble_probe_armed = true;
-    timer_mod(s->rwble_probe_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+    esp32_bt_sched(s, ESP32_BT_TMR_RWBLE_PROBE, s->rwble_probe_timer,
+                   delay_ns);
     ESP32_BT_LOG(s,
                   "esp32_bt: RWBLE probe armed: bit %u delay=%" PRIu64
                   " ns\n",
@@ -272,9 +354,8 @@ static void esp32_bt_rwble_probe_arm_start(Esp32BtState *s)
     }
     if (s->bb_sw_inject && !s->bb_sw_armed) {
         s->bb_sw_armed = true;
-        timer_mod(s->bb_sw_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  s->bb_sw_interval_ns);
+        esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
+                       s->bb_sw_interval_ns);
     }
 }
 
@@ -380,7 +461,7 @@ static void esp32_bt_rx_frame_inject(void *opaque)
         return;
     }
     s->bb_rx_fired = true;
-    timer_del(s->bb_ea_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_EA_TICK, s->bb_ea_timer);
 
     desc = s->rwbt[RWBT_CURRENT_RXDESC / 4] & 0x7fffu;
     if (!esp32_bt_rxdesc_valid(desc)) {
@@ -466,9 +547,8 @@ static void esp32_bt_ea_tick(void *opaque)
                   "esp32_bt: EA tick %u, status=%08x\n",
                   s->bb_ea_ticks, s->rwbt_irq_status);
     esp32_bt_update_irqs(s);
-    timer_mod(s->bb_ea_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              s->bb_ea_interval_ns);
+    esp32_bt_sched(s, ESP32_BT_TMR_EA_TICK, s->bb_ea_timer,
+                   s->bb_ea_interval_ns);
 }
 
 /*
@@ -484,14 +564,26 @@ static void esp32_bt_sw_tick(void *opaque)
     if (!s->bb_sw_inject) {
         return;
     }
+    /*
+     * A synthetic SW tick must not preempt a released RX frame.  If bit 16 is
+     * already pending when r_rwbt_isr acknowledges the frame status, the
+     * guest walks the software EA list before the frame handler and the
+     * inquiry result is never emitted.  Keep the cadence but skip the edge
+     * while the frame window is open; the next tick after the guest reads
+     * RWBT 0x02c still exercises the bit-16 path.
+     */
+    if (s->bb_rx_window) {
+        esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
+                       s->bb_sw_interval_ns);
+        return;
+    }
     s->rwbt_irq_status |= 1u << RWBT_SW_STATUS_BIT;
     ESP32_BT_LOG(s, "esp32_bt: SW tick n=%u status=%08x\n",
                   s->bb_sw_ticks, s->rwbt_irq_status);
     s->bb_sw_ticks++;
     esp32_bt_update_irqs(s);
-    timer_mod(s->bb_sw_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              s->bb_sw_interval_ns);
+    esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
+                   s->bb_sw_interval_ns);
 }
 
 static void esp32_bt_ea_start(Esp32BtState *s)
@@ -499,9 +591,8 @@ static void esp32_bt_ea_start(Esp32BtState *s)
     if (!s->bb_ea_inject || s->bb_ea_ticks != 0) {
         return;
     }
-    timer_mod(s->bb_ea_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              s->bb_ea_interval_ns);
+    esp32_bt_sched(s, ESP32_BT_TMR_EA_TICK, s->bb_ea_timer,
+                   s->bb_ea_interval_ns);
 }
 
 /*
@@ -540,8 +631,7 @@ static void esp32_bt_ea_fire(void *opaque)
         if (target_ticks > s->clock_floor) {
             s->clock_floor = target_ticks;
         }
-        s->clock_hold_until =
-            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200000;
+        s->clock_hold_until = esp32_bt_now_ns(s) + 200000;
     }
     s->rwbt_irq_status |= 1u << RWBT_EA_STATUS_BIT;
     ESP32_BT_LOG(s,
@@ -561,7 +651,7 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
         return;
     }
     if (!s->ea_mask_enabled || !s->ea_target_valid || s->ea_status_pending) {
-        timer_del(s->bb_fine_timer);
+        esp32_bt_cancel(s, ESP32_BT_TMR_EA_FINE, s->bb_fine_timer);
         s->ea_armed = false;
         return;
     }
@@ -580,8 +670,7 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
         delay_ns = (uint64_t)delta * ESP32_BT_EA_SLOT_NS;
     }
 
-    timer_mod(s->bb_fine_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+    esp32_bt_sched(s, ESP32_BT_TMR_EA_FINE, s->bb_fine_timer, delay_ns);
     if (!s->ea_armed) {
         ESP32_BT_LOG(s,
                       "esp32_bt: EA fine armed target=%08x now=%08x "
@@ -681,9 +770,8 @@ static void esp32_bt_rx_watch_poll(void *opaque)
         }
     }
 
-    timer_mod(s->bb_rx_watch_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              s->bb_rx_watch_poll_ns);
+    esp32_bt_sched(s, ESP32_BT_TMR_RX_WATCH, s->bb_rx_watch_timer,
+                   s->bb_rx_watch_poll_ns);
 }
 
 static void esp32_bt_rx_watch_arm_start(Esp32BtState *s)
@@ -707,9 +795,13 @@ static void esp32_bt_rx_inject_arm(Esp32BtState *s)
         return;
     }
     s->bb_rx_armed = true;
+    s->bb_rx_window = true;
+    if (s->bt_clock_anchor && strcmp(s->bt_clock_anchor, "rx") == 0) {
+        esp32_bt_model_anchor(s, "RX inject arm");
+    }
     esp32_bt_ea_start(s);
-    timer_mod(s->bb_rx_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->bb_rx_delay_ns);
+    esp32_bt_sched(s, ESP32_BT_TMR_RX_INJECT, s->bb_rx_timer,
+                   s->bb_rx_delay_ns);
     ESP32_BT_LOG(s,
                   "esp32_bt: RX inject armed (delay=%" PRIu64 " ns, clock=%u)\n",
                   s->bb_rx_delay_ns, esp32_bt_bt_clk(s));
@@ -743,10 +835,10 @@ static void esp32_bt_begin_wakeup(Esp32BtState *s)
     s->wake_in_progress = true;
     s->wakeup_ack_seen = false;
     s->wakeup_end_armed = false;
-    timer_del(s->wakeup_timer);
-    timer_del(s->wakeup_end_timer);
-    timer_mod(s->wakeup_start_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->wakeup_start_ns);
+    esp32_bt_cancel(s, ESP32_BT_TMR_WAKEUP, s->wakeup_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_WAKEUP_END, s->wakeup_end_timer);
+    esp32_bt_sched(s, ESP32_BT_TMR_WAKEUP_START, s->wakeup_start_timer,
+                   s->wakeup_start_ns);
     ESP32_BT_LOG(s, "esp32_bt: wakeup requested\n");
 }
 
@@ -759,9 +851,8 @@ static void esp32_bt_sleep_ack(void *opaque)
                   *esp32_bt_sleep_ctrl(s));
 
     if (s->wakeup_interval_ns) {
-        timer_mod(s->wakeup_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  s->wakeup_interval_ns);
+        esp32_bt_sched(s, ESP32_BT_TMR_WAKEUP, s->wakeup_timer,
+                       s->wakeup_interval_ns);
     }
 }
 
@@ -772,9 +863,8 @@ static void esp32_bt_wakeup_timer(void *opaque)
     if (!(*esp32_bt_sleep_ctrl(s) & RWBT_SLEEP_STATE)) {
         /* Not asleep: try again later rather than spinning. */
         if (s->wakeup_interval_ns) {
-            timer_mod(s->wakeup_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      s->wakeup_interval_ns);
+            esp32_bt_sched(s, ESP32_BT_TMR_WAKEUP, s->wakeup_timer,
+                           s->wakeup_interval_ns);
         }
         return;
     }
@@ -818,12 +908,312 @@ static void esp32_bt_wakeup_end(void *opaque)
     esp32_bt_update_irqs(s);
 }
 
+static void esp32_bt_fire_one(Esp32BtState *s, int id)
+{
+    switch (id) {
+    case ESP32_BT_TMR_EA_FINE:
+        esp32_bt_ea_fire(s);
+        break;
+    case ESP32_BT_TMR_RX_INJECT:
+        esp32_bt_rx_frame_inject(s);
+        break;
+    case ESP32_BT_TMR_SW_TICK:
+        esp32_bt_sw_tick(s);
+        break;
+    case ESP32_BT_TMR_EA_TICK:
+        esp32_bt_ea_tick(s);
+        break;
+    case ESP32_BT_TMR_RX_WATCH:
+        esp32_bt_rx_watch_poll(s);
+        break;
+    case ESP32_BT_TMR_SLEEP_ACK:
+        esp32_bt_sleep_ack(s);
+        break;
+    case ESP32_BT_TMR_WAKEUP:
+        esp32_bt_wakeup_timer(s);
+        break;
+    case ESP32_BT_TMR_WAKEUP_START:
+        esp32_bt_wakeup_start(s);
+        break;
+    case ESP32_BT_TMR_WAKEUP_END:
+        esp32_bt_wakeup_end(s);
+        break;
+    case ESP32_BT_TMR_RWBLE_PROBE:
+        esp32_bt_rwble_probe_fire(s);
+        break;
+    }
+}
+
+static void esp32_bt_model_process_due(Esp32BtState *s)
+{
+    int guard = 0;
+
+    while (guard++ < 10000) {
+        int best = -1;
+        uint64_t best_deadline = UINT64_MAX;
+
+        for (int i = 0; i < ESP32_BT_TMR_COUNT; i++) {
+            if (!s->model_active[i]) {
+                continue;
+            }
+            if (s->model_deadline[i] <= s->model_ns &&
+                s->model_deadline[i] < best_deadline) {
+                best = i;
+                best_deadline = s->model_deadline[i];
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        s->model_active[best] = false;
+        esp32_bt_fire_one(s, best);
+    }
+}
+
+/*
+ * Advance the deterministic model clock and fire every due event in deadline
+ * order before the guest access is handled.  Ties keep the enum priority:
+ * the fine timer is processed before RX injection and the software tick, which
+ * preserves the fine-timer -> 0x024 -> FHS -> Inquiry Result ordering.
+ */
+static void esp32_bt_model_advance(Esp32BtState *s)
+{
+    if (!esp32_bt_model_clock(s)) {
+        return;
+    }
+    if (!s->model_started) {
+        if (esp32_bt_model_boot_start(s)) {
+            /* The boot path keeps host timing until the first fine target. */
+            return;
+        }
+        s->model_started = true;
+        s->model_base_ns = 0;
+        s->model_base_count = esp32_bt_guest_instructions();
+    }
+    if (!s->model_idle_armed) {
+        s->model_idle_armed = true;
+        timer_mod(s->model_idle_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    }
+    s->model_ns = esp32_bt_now_ns(s);
+    esp32_bt_model_process_due(s);
+}
+
+/*
+ * Idle backstop for the model clock.
+ *
+ * The controller can sleep on a BT interrupt without touching a BT register,
+ * so a clock advanced only by BT accesses would deadlock.  This virtual-time
+ * timer fires every millisecond and advances the model time by one step only
+ * when no BT access happened since the previous tick.  During BT activity the
+ * timer is inert, so the model trajectory remains access-driven; the idle
+ * amount is fixed, so the event order is stable even though the wall-clock
+ * moment of the tick is not.
+ */
+static void esp32_bt_model_idle(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+
+    if (!esp32_bt_model_clock(s)) {
+        return;
+    }
+    if (!s->model_started) {
+        if (esp32_bt_model_boot_start(s)) {
+            timer_mod(s->model_idle_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+            return;
+        }
+        s->model_started = true;
+        s->model_base_ns = 0;
+        s->model_base_count = esp32_bt_guest_instructions();
+    }
+    s->model_ns = esp32_bt_now_ns(s);
+    esp32_bt_model_process_due(s);
+    timer_mod(s->model_idle_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+}
+
+static uint32_t esp32_bt_vhci_hash(const uint8_t *buf, uint32_t len)
+{
+    uint32_t h = 2166136261u;
+    uint32_t n = MIN(len, 24u);
+
+    for (uint32_t i = 0; i < n; i++) {
+        h = (h ^ buf[i]) * 16777619u;
+    }
+    return h ^ (len * 2654435761u);
+}
+
+static void esp32_bt_vhci_log(Esp32BtState *s, const char *dir, uint32_t addr,
+                              uint32_t len)
+{
+    uint8_t buf[256];
+    uint32_t n = MIN(len, sizeof(buf));
+    uint32_t i;
+
+    if (n == 0) {
+        return;
+    }
+    address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                       buf, n);
+    /*
+     * Three shapes so both historical claim families keep working:
+     *   H2C len=4 01 03 0c 00            (hci-capture)
+     *   H2C len=4 hdr=01 03 0c           (rx-model)
+     *   H2C dump 0x01 0x03 0x0c 0x00     (rx-model byte dump)
+     */
+    qemu_log("%s len=%u", dir, len);
+    for (i = 0; i < n; i++) {
+        qemu_log(" %02x", buf[i]);
+    }
+    qemu_log("\n");
+    qemu_log("%s len=%u hdr=%02x %02x %02x\n", dir, len, buf[0],
+             n > 1 ? buf[1] : 0, n > 2 ? buf[2] : 0);
+    qemu_log("%s dump", dir);
+    for (i = 0; i < n; i++) {
+        qemu_log(" 0x%02x", buf[i]);
+    }
+    qemu_log("\n");
+}
+
+/*
+ * Anchor the deterministic timebase at the host's HCI_Inquiry command.
+ *
+ * The boot path before the BT model runs under host virtual time, so the
+ * instruction count at which the host issues the inquiry varies with host
+ * speed.  The controller then programs fine-timer targets relative to that
+ * count, which changes the pre-inquiry event phase and sometimes loses the
+ * inquiry result.  Restarting the instruction-count base at the inquiry
+ * command makes the inquiry event schedule identical on every run.  The
+ * absolute clock is still model-defined, not silicon.
+ */
+static void esp32_bt_model_anchor(Esp32BtState *s, const char *why)
+{
+    if (!esp32_bt_model_clock(s) || !s->model_started || s->model_anchored) {
+        return;
+    }
+    if (!s->bt_clock_anchor ||
+        (strcmp(s->bt_clock_anchor, "inquiry") != 0 &&
+         strcmp(s->bt_clock_anchor, "rx") != 0)) {
+        return;
+    }
+    s->model_anchored = true;
+    /*
+     * Keep the model timebase where it is: the guest has already programmed
+     * fine-timer targets against it, and moving it turns them into far-future
+     * or wrapped events.  Only the synthetic software-tick cadence is re-based,
+     * so bit 16 cannot land at a host-speed-dependent phase inside the inquiry
+     * window.
+     */
+    s->model_base_count = esp32_bt_guest_instructions();
+    s->model_base_ns = s->model_ns;
+    s->bb_sw_ticks = 0;
+    s->bb_sw_armed = true;
+    esp32_bt_cancel(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer);
+    esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
+                   s->bb_sw_interval_ns);
+    /*
+     * Force the next fine-timer expiry to a fixed offset from the inquiry
+     * command.  The guest has programmed a target from the variable boot
+     * phase; re-aiming it at a fixed slot makes the inquiry event-start
+     * callback run at the same point on every boot.  The callback then
+     * programs its own next target normally.
+     */
+    if (strcmp(why, "HCI_Inquiry") == 0) {
+        uint32_t slot = (esp32_bt_ea_now_slot(s) + 8) &
+                        ESP32_BT_EA_WRAP_MASK;
+
+        s->ea_target = slot;
+        s->rwbt[RWBT_EA_TARGET / 4] = slot;
+        s->ea_target_valid = true;
+        s->ea_status_pending = false;
+        s->ea_armed = false;
+        esp32_bt_ea_rearm(s);
+    }
+    ESP32_BT_LOG(s, "esp32_bt: model clock anchored at %s\n", why);
+}
+
+/*
+ * Plugin entry point.  The vhci-trace TCG plugin observes the H2C staging
+ * window more reliably than the device-side sampler, so it calls this when the
+ * host stages HCI_Inquiry.  Only the explicit `bt-clock-anchor=inquiry` mode
+ * reacts; the default model clock is unchanged.
+ */
+void esp32_bt_model_anchor_from_plugin(void);
+
+void esp32_bt_model_anchor_from_plugin(void)
+{
+    Esp32BtState *s = esp32_bt_plugin_state;
+
+    if (s && s->bt_clock_anchor &&
+        strcmp(s->bt_clock_anchor, "inquiry") == 0) {
+        esp32_bt_model_anchor(s, "HCI_Inquiry");
+    }
+}
+
+/*
+ * Sample the VHCI environment.  The host-to-controller packet is staged at
+ * env+0x28 with length/offset at +0x4d8/+0x4dc; the controller-to-host packet
+ * pointer/length is at env+0x00/+0x04 (vhci_send).  A key suppresses repeated
+ * samples of the same packet while it is still present; clearing the buffer
+ * resets the key so an identical later packet is logged again.
+ */
+static void esp32_bt_vhci_sample(Esp32BtState *s)
+{
+    uint32_t env, count, offset, ptr, len, key;
+    uint8_t head[24];
+
+    if (!s->vhci_env_addr) {
+        return;
+    }
+    env = esp32_bt_read32(s->vhci_env_addr);
+    if (!env) {
+        return;
+    }
+
+    count = esp32_bt_read32(env + 0x4d8);
+    offset = esp32_bt_read32(env + 0x4dc);
+    if (offset == 0 && count > 0 && count < 4096) {
+        address_space_read(&address_space_memory, env + 0x28,
+                           MEMTXATTRS_UNSPECIFIED, head,
+                           MIN(count, sizeof(head)));
+        key = esp32_bt_vhci_hash(head, count);
+        if (key != s->vhci_rx_key) {
+            s->vhci_rx_key = key;
+            esp32_bt_vhci_log(s, "H2C", env + 0x28, count);
+            if (count >= 3 && head[0] == 0x01 && head[1] == 0x01 &&
+                head[2] == 0x04) {
+                if (s->bt_clock_anchor && strcmp(s->bt_clock_anchor, "inquiry") == 0) {
+                    esp32_bt_model_anchor(s, "HCI_Inquiry");
+                }
+            }
+        }
+    } else {
+        s->vhci_rx_key = 0;
+    }
+
+    ptr = esp32_bt_read32(env);
+    len = esp32_bt_read32(env + 4);
+    if (ptr && len > 0 && len < 4096) {
+        address_space_read(&address_space_memory, ptr, MEMTXATTRS_UNSPECIFIED,
+                           head, MIN(len, sizeof(head)));
+        key = esp32_bt_vhci_hash(head, len) ^ ptr;
+        if (key != s->vhci_tx_key) {
+            s->vhci_tx_key = key;
+            esp32_bt_vhci_log(s, "C2H", ptr, len);
+        }
+    } else {
+        s->vhci_tx_key = 0;
+    }
+}
+
 static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32BtState *s = ESP32_BT(opaque);
     uint32_t r;
     uint32_t off = addr & ~3u;
 
+    esp32_bt_model_advance(s);
     esp32_bt_rwble_probe_arm_start(s);
     esp32_bt_rx_watch_arm_start(s);
 
@@ -894,6 +1284,15 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
     case RWBLE_CLK_HI:
         r = 0;
         break;
+    case RWBT_CURRENT_RXDESC:
+        /*
+         * The guest consumes the injected frame by reading the current RX
+         * descriptor.  Close the SW-tick suppression window here so later
+         * bit-16 ticks keep advancing the frame-manager program.
+         */
+        r = s->rwbt[off / 4];
+        s->bb_rx_window = false;
+        break;
     default:
         r = s->rwbt[off / 4];
         break;
@@ -902,6 +1301,7 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
     ESP32_BT_LOG(s, "esp32_bt: %s read  %04x -> %08x\n",
                   esp32_bt_block(off), (uint32_t)off, r);
     log_mmio_access(ESP32_BT_RWBT_BASE + off, r, false);
+    esp32_bt_vhci_sample(s);
     return r;
 }
 
@@ -913,6 +1313,7 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     uint32_t v = (uint32_t)value;
     uint32_t prev = s->rwbt[off / 4];
 
+    esp32_bt_model_advance(s);
     esp32_bt_rwble_probe_arm_start(s);
     esp32_bt_rx_watch_arm_start(s);
 
@@ -959,17 +1360,15 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         if ((v & RWBT_IRQ_WAKEUP) && s->wake_in_progress) {
             s->wakeup_ack_seen = true;
             if (!s->wakeup_end_armed) {
-                timer_mod(s->wakeup_end_timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                          20000000);
+                esp32_bt_sched(s, ESP32_BT_TMR_WAKEUP_END,
+                               s->wakeup_end_timer, 20000000);
             }
         }
         if (v == 0xffffffffu && s->wake_in_progress &&
             s->wakeup_ack_seen) {
             s->wakeup_end_armed = true;
-            timer_mod(s->wakeup_end_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      s->wakeup_end_ns);
+            esp32_bt_sched(s, ESP32_BT_TMR_WAKEUP_END,
+                           s->wakeup_end_timer, s->wakeup_end_ns);
         }
         break;
     case RWBLE_IRQ_CLEAR:
@@ -989,6 +1388,54 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         s->rwbt[off / 4] = v;
         s->ea_target = v;
         s->ea_target_valid = true;
+        if (esp32_bt_model_clock(s) && !s->model_started &&
+            esp32_bt_model_boot_start(s)) {
+            /*
+             * Start the deterministic clock at the guest's first fine-timer
+             * target.  The boot path therefore ran under host timing, and the
+             * model begins one 625 us slot before the programmed target, so
+             * the first expiry is relative and reproducible while the guest's
+             * own "target == clock" check still passes.
+             */
+            uint32_t slot = v & ESP32_BT_EA_WRAP_MASK;
+
+            s->model_base_ns = slot ?
+                (uint64_t)(slot - 1) * ESP32_BT_EA_SLOT_NS : 0;
+            s->model_base_count = esp32_bt_guest_instructions();
+            s->model_ns = s->model_base_ns;
+            s->model_started = true;
+            s->model_accesses = 0;
+            /* Drop timers armed under host timing; re-arm the model ones. */
+            timer_del(s->sleep_ack_timer);
+            timer_del(s->wakeup_timer);
+            timer_del(s->wakeup_start_timer);
+            timer_del(s->wakeup_end_timer);
+            timer_del(s->rwble_probe_timer);
+            timer_del(s->bb_rx_timer);
+            timer_del(s->bb_ea_timer);
+            timer_del(s->bb_sw_timer);
+            timer_del(s->bb_fine_timer);
+            timer_del(s->bb_rx_watch_timer);
+            for (int i = 0; i < ESP32_BT_TMR_COUNT; i++) {
+                s->model_active[i] = false;
+            }
+            if (s->bb_sw_inject && s->bb_sw_armed) {
+                esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
+                               s->bb_sw_interval_ns);
+            }
+            if (s->bb_ea_inject) {
+                esp32_bt_sched(s, ESP32_BT_TMR_EA_TICK, s->bb_ea_timer,
+                               s->bb_ea_interval_ns);
+            }
+            if (!s->model_idle_armed) {
+                s->model_idle_armed = true;
+                timer_mod(s->model_idle_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+            }
+            ESP32_BT_LOG(s,
+                          "esp32_bt: model clock start target=%08x clock=%u\n",
+                          v, esp32_bt_bt_clk(s));
+        }
         esp32_bt_ea_rearm(s);
         break;
     case RWBLE_IRQ_ACK:
@@ -1009,10 +1456,9 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
             (v & RWBT_SLEEP_REQUEST)) {
             /* New sleep request: the baseband is no longer "asleep" yet. */
             v &= ~RWBT_SLEEP_STATE;
-            timer_del(s->wakeup_timer);
-            timer_mod(s->sleep_ack_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      s->sleep_ack_ns);
+            esp32_bt_cancel(s, ESP32_BT_TMR_WAKEUP, s->wakeup_timer);
+            esp32_bt_sched(s, ESP32_BT_TMR_SLEEP_ACK, s->sleep_ack_timer,
+                           s->sleep_ack_ns);
             ESP32_BT_LOG(s, "esp32_bt: sleep request\n");
         }
 
@@ -1037,6 +1483,7 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     ESP32_BT_LOG(s, "esp32_bt: %s write %04x <- %08x\n",
                   esp32_bt_block(off), (uint32_t)off, v);
     log_mmio_access(ESP32_BT_RWBT_BASE + off, v, true);
+    esp32_bt_vhci_sample(s);
 
     /*
      * Arm the opt-in RWBLE probe on the selected RWBLE register write.
@@ -1072,6 +1519,8 @@ static uint64_t esp32_bt_bb_read(void *opaque, hwaddr addr, unsigned int size)
     uint32_t off = addr & ~3u;
     uint32_t r = s->bb[off / 4];
 
+    esp32_bt_model_advance(s);
+
     ESP32_BT_LOG(s, "esp32_bt: BB    read  %04x -> %08x\n",
                   (uint32_t)off, r);
     log_mmio_access(ESP32_BT_BB_BASE + off, r, false);
@@ -1085,6 +1534,7 @@ static void esp32_bt_bb_write(void *opaque, hwaddr addr,
     uint32_t off = addr & ~3u;
     uint32_t v = (uint32_t)value;
 
+    esp32_bt_model_advance(s);
     s->bb[off / 4] = v;
     ESP32_BT_LOG(s, "esp32_bt: BB    write %04x <- %08x\n",
                   (uint32_t)off, v);
@@ -1118,22 +1568,24 @@ static void esp32_bt_reset(DeviceState *dev)
     s->wake_in_progress = false;
     s->wakeup_ack_seen = false;
     s->wakeup_end_armed = false;
-    timer_del(s->sleep_ack_timer);
-    timer_del(s->wakeup_timer);
-    timer_del(s->wakeup_start_timer);
-    timer_del(s->wakeup_end_timer);
-    timer_del(s->rwble_probe_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_SLEEP_ACK, s->sleep_ack_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_WAKEUP, s->wakeup_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_WAKEUP_START, s->wakeup_start_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_WAKEUP_END, s->wakeup_end_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_RWBLE_PROBE, s->rwble_probe_timer);
     s->rwble_probe_armed = false;
     s->rwble_probe_fired = false;
-    timer_del(s->bb_rx_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_RX_INJECT, s->bb_rx_timer);
     s->bb_rx_armed = false;
     s->bb_rx_fired = false;
-    timer_del(s->bb_ea_timer);
+    s->bb_rx_window = false;
+    s->model_anchored = false;
+    esp32_bt_cancel(s, ESP32_BT_TMR_EA_TICK, s->bb_ea_timer);
     s->bb_ea_ticks = 0;
-    timer_del(s->bb_sw_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer);
     s->bb_sw_armed = false;
     s->bb_sw_ticks = 0;
-    timer_del(s->bb_fine_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_EA_FINE, s->bb_fine_timer);
     s->ea_target = 0;
     s->ea_target_valid = false;
     s->ea_mask_enabled = false;
@@ -1142,11 +1594,24 @@ static void esp32_bt_reset(DeviceState *dev)
     s->ea_fires = 0;
     s->clock_floor = 0;
     s->clock_hold_until = 0;
-    timer_del(s->bb_rx_watch_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_RX_WATCH, s->bb_rx_watch_timer);
     s->bb_rx_watch_armed = false;
     s->bb_rx_watch_gated = false;
     s->bb_rx_watch_done = false;
     s->bb_rx_watch_fires = 0;
+    s->model_ns = 0;
+    s->model_base_ns = 0;
+    s->model_base_count = 0;
+    s->model_started = false;
+    s->model_accesses = 0;
+    s->vhci_rx_key = 0;
+    s->vhci_tx_key = 0;
+    s->model_idle_armed = false;
+    timer_del(s->model_idle_timer);
+    for (int i = 0; i < ESP32_BT_TMR_COUNT; i++) {
+        s->model_deadline[i] = 0;
+        s->model_active[i] = false;
+    }
     esp32_bt_update_irqs(s);
 
     /* Best-effort reset-time arm; the first guest access arms it otherwise. */
@@ -1166,6 +1631,8 @@ static void esp32_bt_reset(DeviceState *dev)
 static void esp32_bt_init(Object *obj)
 {
     Esp32BtState *s = ESP32_BT(obj);
+
+    esp32_bt_plugin_state = s;
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memory_region_init_io(&s->iomem_rwbt, obj, &esp32_bt_rwbt_ops, s,
@@ -1198,6 +1665,8 @@ static void esp32_bt_init(Object *obj)
                                     esp32_bt_ea_fire, s);
     s->bb_rx_watch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                         esp32_bt_rx_watch_poll, s);
+    s->model_idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       esp32_bt_model_idle, s);
 }
 
 static void esp32_bt_class_init(ObjectClass *klass, void *data)
@@ -1210,6 +1679,22 @@ static void esp32_bt_class_init(ObjectClass *klass, void *data)
 static Property esp32_bt_properties[] = {
     /* Trace only this device to the -D log without -d unimp. */
     DEFINE_PROP_BOOL("bt-trace", Esp32BtState, bt_trace, false),
+
+    /*
+     * Opt-in deterministic model clock (iteration 7).  `host` (default) keeps
+     * the historical QEMU_CLOCK_VIRTUAL timing.  `model` advances a model
+     * timebase on every BT register access and processes due events from it,
+     * so tracing or gdb cannot change the event order.  bt-clock-step-ns is
+     * the time added per access.
+     */
+    DEFINE_PROP_STRING("bt-clock", Esp32BtState, bt_clock),
+    DEFINE_PROP_STRING("bt-clock-start", Esp32BtState, bt_clock_start),
+    DEFINE_PROP_STRING("bt-clock-anchor", Esp32BtState, bt_clock_anchor),
+    DEFINE_PROP_UINT32("vhci-env", Esp32BtState, vhci_env_addr, 0),
+    DEFINE_PROP_UINT64("bt-clock-step-ns", Esp32BtState,
+                       bt_clock_step_ns, 4),
+    DEFINE_PROP_UINT64("bt-clock-idle-step-ns", Esp32BtState,
+                       bt_clock_idle_step_ns, 0),
 
     /*
      * Synthetic sleep-timer period.  The real block wakes up when the timer

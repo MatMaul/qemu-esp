@@ -44,6 +44,9 @@
 #include "tb-context.h"
 #include "internal.h"
 
+/* Executed guest instructions per vCPU; see include/qemu/timer.h. */
+uint64_t qemu_guest_instruction_count[16];
+
 /* -icount align implementation. */
 
 typedef struct SyncClocks {
@@ -1010,6 +1013,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 tb_add_jump(last_tb, tb_exit, tb);
             }
 
+            if (cpu->cpu_index < 16) {
+                qemu_guest_instruction_count[cpu->cpu_index] += tb->icount;
+            }
             cpu_loop_exec_tb(cpu, tb, pc, &last_tb, &tb_exit);
 
             /* Try to align the host and virtual clocks

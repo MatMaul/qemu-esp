@@ -57,6 +57,44 @@ typedef struct Esp32BtState {
     /* Opt-in device-only trace; see ESP32_BT_LOG() in esp32_bt.c. */
     bool bt_trace;
 
+    /*
+     * Opt-in VHCI capture (iteration 7).  `vhci-env` is the guest address of
+     * the `vhci_env_p` pointer.  The model samples the host-to-controller and
+     * controller-to-host buffers on BT register activity and logs one line per
+     * distinct packet, so a session can capture HCI bytes without a gdb
+     * breakpoint on every VHCI access.
+     */
+    uint32_t vhci_env_addr;
+    uint32_t vhci_rx_key;
+    uint32_t vhci_tx_key;
+
+    /*
+     * Opt-in deterministic model clock (iteration 7).
+     *
+     * `bt-clock=model` advances a model timebase from guest-visible BT
+     * activity instead of QEMU_CLOCK_VIRTUAL, which tracks host wall time.
+     * Each RWBT/RWBLE/BB register access adds `bt-clock-step-ns` and processes
+     * every modelled event whose deadline is now due.  The model timers below
+     * then use that timebase, so tracing or gdb no longer changes the event
+     * ordering.  This is model-defined timing, not silicon validation; the
+     * default remains `host` for compatibility with the stock baselines.
+     */
+    char *bt_clock;
+    char *bt_clock_start;
+    char *bt_clock_anchor;
+    uint64_t bt_clock_step_ns;
+    uint64_t bt_clock_idle_step_ns;
+    bool model_started;
+    bool model_anchored;
+    uint64_t model_ns;
+    uint64_t model_base_ns;
+    uint64_t model_base_count;
+    uint64_t model_deadline[16];
+    bool model_active[16];
+    QEMUTimer *model_idle_timer;
+    bool model_idle_armed;
+    uint64_t model_accesses;
+
     qemu_irq irq_rwbt;
     qemu_irq irq_rwble;
 
@@ -133,6 +171,7 @@ typedef struct Esp32BtState {
     uint32_t bb_rx_status_bit;
     bool bb_rx_armed;
     bool bb_rx_fired;
+    bool bb_rx_window;
     QEMUTimer *bb_rx_timer;
 
     /*

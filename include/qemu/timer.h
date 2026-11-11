@@ -998,4 +998,12 @@ static inline int64_t profile_getclock(void)
 extern int64_t dev_time;
 #endif
 
+/*
+ * Executed guest instruction count per vCPU (iteration 7).  Incremented by
+ * accel/tcg/cpu-exec.c once per translated block.  The opt-in ESP32 BT model
+ * clock uses CPU 0 as a deterministic guest-progress timebase, independent of
+ * host wall time and of tracing/gdb slowdown.
+ */
+extern uint64_t qemu_guest_instruction_count[16];
+
 #endif
