@@ -106,6 +106,7 @@
  * can be modelled without editing the device.
  */
 #define RWBT_CURRENT_RXDESC 0x02c
+#define RWBT_EA_TARGET      0x0b8
 #define RWBT_RXDESC_BASE     0x2382u
 #define RWBT_RXDESC_LAST     0x23acu
 #define RWBT_RXDESC_STRIDE   0x0eu
@@ -114,6 +115,22 @@
 #define RWBT_RX_STATUS_BIT   1
 #define RWBT_EA_STATUS_BIT   9
 #define RWBT_EA_MAX_TICKS    400
+
+/*
+ * Fine-timer clock units.
+ *
+ * RWBT 0x01c is the hardware native clock; one tick is half a Bluetooth slot
+ * (312.5 us).  The ROM's r_ld_read_clock() and r_ea_time_get_halfslot_rounded()
+ * mask 0x01c with 0x0fffffff and shift right by one, so the event arbiter works
+ * in 625 us slot units.  ea_prog_timer() writes that slot-unit target to RWBT
+ * 0x0b8 (docs/03 §2.1, docs/09 §3.8).  The 27-bit wrapping range and the
+ * "already due" half-range below are the constants ea_prog_timer uses.
+ */
+#define ESP32_BT_CLK_TICK_NS     312500ull
+#define ESP32_BT_EA_SLOT_NS      625000ull
+#define ESP32_BT_EA_TIME_MASK    0x0fffffffu
+#define ESP32_BT_EA_WRAP_MASK    0x7ffffffu
+#define ESP32_BT_EA_HALF_RANGE   0x4000000u
 
 /* The BB block exposes the exchange-memory base at 0x0a0 (docs/03 §3). */
 #define ESP32_BT_BB_EM_BASE  0x0a0
@@ -135,6 +152,20 @@
 
 /* Bits in *_WAKEUP_BOUND that are also write-only/self-clearing. */
 #define BT_WAKEUP_SELF_CLEAR 0x80000000u
+
+/*
+ * Device log helper.  With bt-trace=on the device writes its own lines to the
+ * -D log without enabling QEMU's global -d unimp mask, so the RX-model
+ * generator can trace only the BT block and keep the guest at full speed.
+ * Without the property the historical -d unimp behaviour is unchanged.
+ */
+#define ESP32_BT_LOG(s, ...) do { \
+    if ((s)->bt_trace) { \
+        qemu_log(__VA_ARGS__); \
+    } else { \
+        qemu_log_mask(LOG_UNIMP, __VA_ARGS__); \
+    } \
+} while (0)
 
 static uint32_t esp32_bt_bt_clk(void)
 {
@@ -183,7 +214,7 @@ static void esp32_bt_rwble_probe_fire(void *opaque)
     s->rwble_probe_fired = true;
     mask = 1u << s->rwble_probe_bit;
     s->rwble_irq_status |= mask;
-    qemu_log_mask(LOG_UNIMP,
+    ESP32_BT_LOG(s,
                   "esp32_bt: RWBLE probe inject bit %u mask=%08x "
                   "status=%08x\n",
                   s->rwble_probe_bit, mask, s->rwble_irq_status);
@@ -200,7 +231,7 @@ static void esp32_bt_rwble_probe_arm(Esp32BtState *s, uint64_t delay_ns)
     s->rwble_probe_armed = true;
     timer_mod(s->rwble_probe_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
-    qemu_log_mask(LOG_UNIMP,
+    ESP32_BT_LOG(s,
                   "esp32_bt: RWBLE probe armed: bit %u delay=%" PRIu64
                   " ns\n",
                   s->rwble_probe_bit, delay_ns);
@@ -300,7 +331,7 @@ static void esp32_bt_rx_frame_inject(void *opaque)
 
     desc = s->rwbt[RWBT_CURRENT_RXDESC / 4] & 0x7fffu;
     if (!esp32_bt_rxdesc_valid(desc)) {
-        qemu_log_mask(LOG_UNIMP,
+        ESP32_BT_LOG(s,
                       "esp32_bt: RX inject skipped: current desc %04x "
                       "is outside the 0x2382 ring\n", desc);
         return;
@@ -347,7 +378,7 @@ static void esp32_bt_rx_frame_inject(void *opaque)
     s->rwbt[RWBT_CURRENT_RXDESC / 4] = next;
     s->rwbt_irq_status |= 1u << (s->bb_rx_status_bit & 31u);
 
-    qemu_log_mask(LOG_UNIMP,
+    ESP32_BT_LOG(s,
                   "esp32_bt: RX frame inject desc=%04x next=%04x "
                   "activity=%u type=%u len=%u payload=%04x staging=%04x "
                   "status=%08x clock=%u\n",
@@ -373,7 +404,7 @@ static void esp32_bt_ea_tick(void *opaque)
     }
     s->bb_ea_ticks++;
     s->rwbt_irq_status |= 1u << RWBT_EA_STATUS_BIT;
-    qemu_log_mask(LOG_UNIMP,
+    ESP32_BT_LOG(s,
                   "esp32_bt: EA tick %u, status=%08x\n",
                   s->bb_ea_ticks, s->rwbt_irq_status);
     esp32_bt_update_irqs(s);
@@ -392,6 +423,194 @@ static void esp32_bt_ea_start(Esp32BtState *s)
               s->bb_ea_interval_ns);
 }
 
+/*
+ * Hardware fine-timer model (iteration 5).
+ *
+ * The ROM programs an absolute slot-unit target in RWBT 0x0b8 and enables the
+ * fine-target interrupt mask (0x00c bit 9).  The hardware compares it with the
+ * native clock and raises RWBT status bit 9; r_rwbt_isr() acknowledges it with
+ * a 0x018 = 0x200 write and dispatches r_ea_finetimer_isr().  This model
+ * reproduces that half of the contract so the controller's event arbiter can
+ * advance and the inquiry event-start callback can push the frame-manager
+ * program.  The payload/air behaviour is still not modelled.
+ */
+static uint32_t esp32_bt_ea_now_slot(void)
+{
+    uint32_t raw = esp32_bt_bt_clk() & ESP32_BT_EA_TIME_MASK;
+
+    /* r_ea_time_get_halfslot_rounded(): ((raw & 0x0fffffff) + 1) >> 1. */
+    return ((raw + 1) >> 1) & ESP32_BT_EA_WRAP_MASK;
+}
+
+static void esp32_bt_ea_fire(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+
+    s->ea_armed = false;
+    if (!s->bb_ea_model) {
+        return;
+    }
+    s->ea_status_pending = true;
+    s->ea_target_valid = false;  /* consumed by this expiry */
+    s->ea_fires++;
+    s->rwbt_irq_status |= 1u << RWBT_EA_STATUS_BIT;
+    ESP32_BT_LOG(s,
+                  "esp32_bt: EA fine fire n=%u target=%08x now=%08x "
+                  "status=%08x clock=%u\n",
+                  s->ea_fires, s->ea_target, esp32_bt_ea_now_slot(),
+                  s->rwbt_irq_status, esp32_bt_bt_clk());
+    esp32_bt_update_irqs(s);
+}
+
+static void esp32_bt_ea_rearm(Esp32BtState *s)
+{
+    uint64_t delay_ns;
+    uint32_t now_slot, delta;
+
+    if (!s->bb_ea_model) {
+        return;
+    }
+    if (!s->ea_mask_enabled || !s->ea_target_valid || s->ea_status_pending) {
+        timer_del(s->bb_fine_timer);
+        s->ea_armed = false;
+        return;
+    }
+
+    now_slot = esp32_bt_ea_now_slot();
+    delta = (s->ea_target - now_slot) & ESP32_BT_EA_WRAP_MASK;
+    if (delta == 0 || delta > ESP32_BT_EA_HALF_RANGE) {
+        /*
+         * The target is due or already in the past.  ea_prog_timer() treats
+         * the same condition as "already due" and returns through its assert
+         * path; the model expires the timer on the next timer slice instead
+         * of scheduling a huge wrapped delay.
+         */
+        delay_ns = 1000;
+    } else {
+        delay_ns = (uint64_t)delta * ESP32_BT_EA_SLOT_NS;
+    }
+
+    timer_mod(s->bb_fine_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+    if (!s->ea_armed) {
+        ESP32_BT_LOG(s,
+                      "esp32_bt: EA fine armed target=%08x now=%08x "
+                      "delta=%u delay=%" PRIu64 "ns clock=%u\n",
+                      s->ea_target, now_slot, delta, delay_ns,
+                      esp32_bt_bt_clk());
+    }
+    s->ea_armed = true;
+}
+
+/*
+ * State-based RX injection trigger (iteration 5).
+ *
+ * Poll a guest address and arm the one-shot frame injection only after the
+ * value becomes non-zero.  The rx-model generator points this at
+ * ld_fm_env+0x14, the frame-manager program queue that r_ld_fm_prog_push()
+ * fills when the inquiry event-start callback runs.  This keeps the frame
+ * delivery after r_ld_inq_start() without depending on a host-time delay.
+ */
+static void esp32_bt_rx_inject_arm(Esp32BtState *s);
+
+static void esp32_bt_rx_watch_poll(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t v = 0;
+
+    if (!s->bb_rx_inject || s->bb_rx_fired) {
+        s->bb_rx_watch_armed = false;
+        return;
+    }
+
+    address_space_read(&address_space_memory, s->bb_rx_watch_addr,
+                       MEMTXATTRS_UNSPECIFIED, &v, sizeof(v));
+    if (s->bb_rx_watch_offset != 0xffffffffu) {
+        /*
+         * Two-level watch: the address holds a pointer, and the observable is
+         * a byte at ptr+offset.  The rx-model generator uses ld_inq_env
+         * (0x3ffb82e4) and inq_state (event+0x3a), which
+         * ld_inq_evt_start_cbk() sets to 1 immediately after it pushes the
+         * frame-manager program.
+         */
+        if (v != 0) {
+            uint8_t state = 0;
+
+            address_space_read(&address_space_memory,
+                               v + s->bb_rx_watch_offset,
+                               MEMTXATTRS_UNSPECIFIED, &state,
+                               sizeof(state));
+            v = state;
+        }
+    }
+
+    if (v != 0) {
+        uint32_t m = v & s->bb_rx_watch_mask;
+
+        if (m != 0 &&
+            (s->bb_rx_watch_value == 0 || m == s->bb_rx_watch_value)) {
+            if (s->bb_rx_watch_after_ea) {
+                /*
+                 * The watched state becomes valid before the event starts
+                 * (r_ld_inq_start registers the inquiry event).  Wait for a
+                 * subsequent fine-timer expiry, which is what runs
+                 * ld_inq_evt_start_cbk() and pushes the frame-manager program.
+                 */
+                if (!s->bb_rx_watch_gated) {
+                    s->bb_rx_watch_gated = true;
+                    s->bb_rx_watch_fires = s->ea_fires;
+                    ESP32_BT_LOG(s,
+                                  "esp32_bt: RX watch gated addr=%08x "
+                                  "value=%08x ea_fires=%u clock=%u\n",
+                                  s->bb_rx_watch_addr, v, s->ea_fires,
+                                  esp32_bt_bt_clk());
+                } else if (s->ea_fires > s->bb_rx_watch_fires) {
+                    s->bb_rx_watch_armed = false;
+                    s->bb_rx_watch_done = true;
+                    ESP32_BT_LOG(s,
+                                  "esp32_bt: RX watch fired addr=%08x "
+                                  "value=%08x offset=%08x ea_fires=%u "
+                                  "clock=%u\n",
+                                  s->bb_rx_watch_addr, v,
+                                  s->bb_rx_watch_offset, s->ea_fires,
+                                  esp32_bt_bt_clk());
+                    esp32_bt_rx_inject_arm(s);
+                    return;
+                }
+            } else {
+                s->bb_rx_watch_armed = false;
+                s->bb_rx_watch_done = true;
+                ESP32_BT_LOG(s,
+                              "esp32_bt: RX watch fired addr=%08x "
+                              "value=%08x offset=%08x clock=%u\n",
+                              s->bb_rx_watch_addr, v, s->bb_rx_watch_offset,
+                              esp32_bt_bt_clk());
+                esp32_bt_rx_inject_arm(s);
+                return;
+            }
+        }
+    }
+
+    timer_mod(s->bb_rx_watch_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              s->bb_rx_watch_poll_ns);
+}
+
+static void esp32_bt_rx_watch_arm_start(Esp32BtState *s)
+{
+    if (!s->bb_rx_inject || s->bb_rx_watch_addr == 0 ||
+        s->bb_rx_watch_armed || s->bb_rx_watch_done || s->bb_rx_fired) {
+        return;
+    }
+    s->bb_rx_watch_armed = true;
+    ESP32_BT_LOG(s,
+                  "esp32_bt: RX watch armed addr=%08x poll=%" PRIu64
+                  "ns clock=%u\n",
+                  s->bb_rx_watch_addr, s->bb_rx_watch_poll_ns,
+                  esp32_bt_bt_clk());
+    esp32_bt_rx_watch_poll(s);
+}
+
 static void esp32_bt_rx_inject_arm(Esp32BtState *s)
 {
     if (!s->bb_rx_inject || s->bb_rx_fired || s->bb_rx_armed) {
@@ -401,7 +620,7 @@ static void esp32_bt_rx_inject_arm(Esp32BtState *s)
     esp32_bt_ea_start(s);
     timer_mod(s->bb_rx_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->bb_rx_delay_ns);
-    qemu_log_mask(LOG_UNIMP,
+    ESP32_BT_LOG(s,
                   "esp32_bt: RX inject armed (delay=%" PRIu64 " ns, clock=%u)\n",
                   s->bb_rx_delay_ns, esp32_bt_bt_clk());
 }
@@ -438,7 +657,7 @@ static void esp32_bt_begin_wakeup(Esp32BtState *s)
     timer_del(s->wakeup_end_timer);
     timer_mod(s->wakeup_start_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->wakeup_start_ns);
-    qemu_log_mask(LOG_UNIMP, "esp32_bt: wakeup requested\n");
+    ESP32_BT_LOG(s, "esp32_bt: wakeup requested\n");
 }
 
 static void esp32_bt_sleep_ack(void *opaque)
@@ -446,7 +665,7 @@ static void esp32_bt_sleep_ack(void *opaque)
     Esp32BtState *s = ESP32_BT(opaque);
 
     *esp32_bt_sleep_ctrl(s) |= RWBT_SLEEP_STATE;
-    qemu_log_mask(LOG_UNIMP, "esp32_bt: sleep ack, 0x030 -> %08x\n",
+    ESP32_BT_LOG(s, "esp32_bt: sleep ack, 0x030 -> %08x\n",
                   *esp32_bt_sleep_ctrl(s));
 
     if (s->wakeup_interval_ns) {
@@ -470,7 +689,7 @@ static void esp32_bt_wakeup_timer(void *opaque)
         return;
     }
 
-    qemu_log_mask(LOG_UNIMP, "esp32_bt: sleep timer expiry\n");
+    ESP32_BT_LOG(s, "esp32_bt: sleep timer expiry\n");
     esp32_bt_begin_wakeup(s);
 }
 
@@ -480,7 +699,7 @@ static void esp32_bt_wakeup_start(void *opaque)
 
     s->wakeup_end_armed = false;
     s->rwbt_irq_status |= RWBT_IRQ_WAKEUP;
-    qemu_log_mask(LOG_UNIMP,
+    ESP32_BT_LOG(s,
                   "esp32_bt: RWBT wakeup start, status=%08x\n",
                   s->rwbt_irq_status);
     esp32_bt_update_irqs(s);
@@ -503,7 +722,7 @@ static void esp32_bt_wakeup_end(void *opaque)
     s->rwbt_irq_status |= RWBT_IRQ_WAKEUP_END;
     *ctrl &= ~(RWBT_SLEEP_STATE | RWBT_WAKEUP_REQ);
     s->wake_in_progress = false;
-    qemu_log_mask(LOG_UNIMP,
+    ESP32_BT_LOG(s,
                   "esp32_bt: RWBT wakeup end, status=%08x 0x030=%08x\n",
                   s->rwbt_irq_status, *ctrl);
     esp32_bt_update_irqs(s);
@@ -516,6 +735,7 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
     uint32_t off = addr & ~3u;
 
     esp32_bt_rwble_probe_arm_start(s);
+    esp32_bt_rx_watch_arm_start(s);
 
     switch (off) {
     case RWBT_CTRL:
@@ -549,9 +769,16 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
          * mask is set when the target it is asked to program is already due
          * (ea.c:497).  With a host-time virtual clock the emulated scheduling
          * path can cross the target before ea_prog_timer() runs, so the model
-         * reports the fine-target mask as enabled (hardware-owned).
+         * reports the fine-target mask as enabled (hardware-owned).  The
+         * opt-in fine-timer model treats that reported state as the real
+         * mask state and re-arms its target timer, so the ROM's later
+         * "already enabled" early return still schedules the expiry.
          */
         r = s->rwbt[off / 4] | 0x200u;
+        if (s->bb_ea_model) {
+            s->ea_mask_enabled = true;
+            esp32_bt_ea_rearm(s);
+        }
         break;
     case RWBLE_IRQ_STATUS:
         r = s->rwble_irq_status;
@@ -582,7 +809,7 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
         break;
     }
 
-    qemu_log_mask(LOG_UNIMP, "esp32_bt: %s read  %04x -> %08x\n",
+    ESP32_BT_LOG(s, "esp32_bt: %s read  %04x -> %08x\n",
                   esp32_bt_block(off), (uint32_t)off, r);
     log_mmio_access(ESP32_BT_RWBT_BASE + off, r, false);
     return r;
@@ -597,6 +824,7 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     uint32_t prev = s->rwbt[off / 4];
 
     esp32_bt_rwble_probe_arm_start(s);
+    esp32_bt_rx_watch_arm_start(s);
 
     switch (off) {
     case RWBT_CTRL:
@@ -616,6 +844,16 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         s->rwbt_irq_status &= ~v;
         s->rwbt[off / 4] = v;
         esp32_bt_update_irqs(s);
+
+        /*
+         * r_rwbt_isr() acknowledges the fine-timer status with 0x018 = 0x200
+         * before it dispatches r_ea_finetimer_isr().  Clear the pending
+         * marker so the next programmed target can arm again.
+         */
+        if (v & (1u << RWBT_EA_STATUS_BIT)) {
+            s->ea_status_pending = false;
+            esp32_bt_ea_rearm(s);
+        }
 
         /*
          * Wakeup sequence handshake.
@@ -652,6 +890,17 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     case RWBT_ISR_ENABLE:
         s->rwbt_irq_enable = v;
         break;
+    case RWBT_INT_MASK:
+        s->rwbt[off / 4] = v;
+        s->ea_mask_enabled = (v >> RWBT_EA_STATUS_BIT) & 1u;
+        esp32_bt_ea_rearm(s);
+        break;
+    case RWBT_EA_TARGET:
+        s->rwbt[off / 4] = v;
+        s->ea_target = v;
+        s->ea_target_valid = true;
+        esp32_bt_ea_rearm(s);
+        break;
     case RWBLE_IRQ_ACK:
         s->rwble_irq_enable = v;
         break;
@@ -674,7 +923,7 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
             timer_mod(s->sleep_ack_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       s->sleep_ack_ns);
-            qemu_log_mask(LOG_UNIMP, "esp32_bt: sleep request\n");
+            ESP32_BT_LOG(s, "esp32_bt: sleep request\n");
         }
 
         s->rwbt[off / 4] = v;
@@ -695,7 +944,7 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         break;
     }
 
-    qemu_log_mask(LOG_UNIMP, "esp32_bt: %s write %04x <- %08x\n",
+    ESP32_BT_LOG(s, "esp32_bt: %s write %04x <- %08x\n",
                   esp32_bt_block(off), (uint32_t)off, v);
     log_mmio_access(ESP32_BT_RWBT_BASE + off, v, true);
 
@@ -711,11 +960,14 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     }
 
     /*
-     * Opt-in baseband RX model: arm on the selected register's bit-0 0->1
-     * transition.  The frame-manager enable path writes 0x00c values such as
-     * 0x05 just after programming the inquiry/ACL activity.
+     * Opt-in baseband RX model: without a state watch address, arm on the
+     * selected register's bit 0->1 transition.  The frame-manager enable path
+     * writes 0x00c values such as 0x05 just after programming the inquiry/ACL
+     * activity.  When bb-rx-watch-addr is set the EM state watch above is the
+     * trigger instead.
      */
-    if (off == s->bb_rx_trigger_off && s->bb_rx_trigger_bit < 32) {
+    if (s->bb_rx_inject && s->bb_rx_watch_addr == 0 &&
+        off == s->bb_rx_trigger_off && s->bb_rx_trigger_bit < 32) {
         uint32_t bit = 1u << s->bb_rx_trigger_bit;
 
         if ((v & bit) != 0 && (prev & bit) == 0) {
@@ -730,7 +982,7 @@ static uint64_t esp32_bt_bb_read(void *opaque, hwaddr addr, unsigned int size)
     uint32_t off = addr & ~3u;
     uint32_t r = s->bb[off / 4];
 
-    qemu_log_mask(LOG_UNIMP, "esp32_bt: BB    read  %04x -> %08x\n",
+    ESP32_BT_LOG(s, "esp32_bt: BB    read  %04x -> %08x\n",
                   (uint32_t)off, r);
     log_mmio_access(ESP32_BT_BB_BASE + off, r, false);
     return r;
@@ -744,7 +996,7 @@ static void esp32_bt_bb_write(void *opaque, hwaddr addr,
     uint32_t v = (uint32_t)value;
 
     s->bb[off / 4] = v;
-    qemu_log_mask(LOG_UNIMP, "esp32_bt: BB    write %04x <- %08x\n",
+    ESP32_BT_LOG(s, "esp32_bt: BB    write %04x <- %08x\n",
                   (uint32_t)off, v);
     log_mmio_access(ESP32_BT_BB_BASE + off, v, true);
 }
@@ -788,6 +1040,18 @@ static void esp32_bt_reset(DeviceState *dev)
     s->bb_rx_fired = false;
     timer_del(s->bb_ea_timer);
     s->bb_ea_ticks = 0;
+    timer_del(s->bb_fine_timer);
+    s->ea_target = 0;
+    s->ea_target_valid = false;
+    s->ea_mask_enabled = false;
+    s->ea_status_pending = false;
+    s->ea_armed = false;
+    s->ea_fires = 0;
+    timer_del(s->bb_rx_watch_timer);
+    s->bb_rx_watch_armed = false;
+    s->bb_rx_watch_gated = false;
+    s->bb_rx_watch_done = false;
+    s->bb_rx_watch_fires = 0;
     esp32_bt_update_irqs(s);
 
     /* Best-effort reset-time arm; the first guest access arms it otherwise. */
@@ -833,6 +1097,10 @@ static void esp32_bt_init(Object *obj)
                                   esp32_bt_rx_frame_inject, s);
     s->bb_ea_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                   esp32_bt_ea_tick, s);
+    s->bb_fine_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    esp32_bt_ea_fire, s);
+    s->bb_rx_watch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        esp32_bt_rx_watch_poll, s);
 }
 
 static void esp32_bt_class_init(ObjectClass *klass, void *data)
@@ -843,6 +1111,9 @@ static void esp32_bt_class_init(ObjectClass *klass, void *data)
 }
 
 static Property esp32_bt_properties[] = {
+    /* Trace only this device to the -D log without -d unimp. */
+    DEFINE_PROP_BOOL("bt-trace", Esp32BtState, bt_trace, false),
+
     /*
      * Synthetic sleep-timer period.  The real block wakes up when the timer
      * programmed through 0x034 expires; this model instead wakes periodically
@@ -906,6 +1177,32 @@ static Property esp32_bt_properties[] = {
     DEFINE_PROP_BOOL("bb-ea-inject", Esp32BtState, bb_ea_inject, false),
     DEFINE_PROP_UINT64("bb-ea-interval-ns", Esp32BtState,
                        bb_ea_interval_ns, 1000000),
+
+    /*
+     * Opt-in hardware fine-timer model (iteration 5).  Disabled by default.
+     * Tracks RWBT 0x0b8 and 0x00c bit 9 and raises RWBT status bit 9 when the
+     * 625 us slot target is reached; see docs/09 §3.8.
+     */
+    DEFINE_PROP_BOOL("bb-ea-timer", Esp32BtState, bb_ea_model, false),
+
+    /*
+     * Opt-in state-based RX trigger (iteration 5).  When bb-rx-watch-addr is
+     * non-zero the one-shot frame injection is armed only after that 32-bit
+     * guest word becomes non-zero.  The rx-model generator uses 0x3ffb8298
+     * (ld_fm_env+0x14, the frame-manager program queue).
+     */
+    DEFINE_PROP_UINT32("bb-rx-watch-addr", Esp32BtState,
+                       bb_rx_watch_addr, 0),
+    DEFINE_PROP_UINT32("bb-rx-watch-mask", Esp32BtState,
+                       bb_rx_watch_mask, 0xffffffffu),
+    DEFINE_PROP_UINT32("bb-rx-watch-offset", Esp32BtState,
+                       bb_rx_watch_offset, 0xffffffffu),
+    DEFINE_PROP_UINT32("bb-rx-watch-value", Esp32BtState,
+                       bb_rx_watch_value, 0),
+    DEFINE_PROP_UINT64("bb-rx-watch-poll-ns", Esp32BtState,
+                       bb_rx_watch_poll_ns, 200000),
+    DEFINE_PROP_BOOL("bb-rx-watch-after-ea", Esp32BtState,
+                     bb_rx_watch_after_ea, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 

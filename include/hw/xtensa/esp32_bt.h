@@ -54,6 +54,9 @@ typedef struct Esp32BtState {
     uint32_t rwbt_irq_enable;
     uint32_t rwble_irq_enable;
 
+    /* Opt-in device-only trace; see ESP32_BT_LOG() in esp32_bt.c. */
+    bool bt_trace;
+
     qemu_irq irq_rwbt;
     qemu_irq irq_rwble;
 
@@ -140,4 +143,44 @@ typedef struct Esp32BtState {
     uint64_t bb_ea_interval_ns;
     uint32_t bb_ea_ticks;
     QEMUTimer *bb_ea_timer;
+
+    /*
+     * Opt-in hardware fine-timer model (iteration 5).  Disabled by default.
+     *
+     * The controller's event arbiter (ROM ea_prog_timer / r_ea_finetimer_isr)
+     * programs an absolute target in RWBT 0x0b8 and enables the fine-target
+     * interrupt mask (0x00c bit 9).  The real block raises RWBT status bit 9
+     * when the native clock reaches that target.  This model tracks the two
+     * software writes, schedules a QEMU timer in the same 625 us slot unit the
+     * ROM uses, and raises status bit 9 on expiry.  The guest acknowledges it
+     * with a 0x018 = 0x200 write.  This is model evidence, not silicon.
+     */
+    bool bb_ea_model;
+    uint32_t ea_target;         /* last value written to RWBT 0x0b8 */
+    bool ea_target_valid;       /* a target has been programmed */
+    bool ea_mask_enabled;       /* 0x00c bit 9, as seen by the ROM */
+    bool ea_status_pending;     /* bit 9 raised, not yet acknowledged */
+    bool ea_armed;
+    uint32_t ea_fires;
+    QEMUTimer *bb_fine_timer;
+
+    /*
+     * Opt-in state-based RX injection trigger (iteration 5).  When
+     * bb-rx-watch-addr is non-zero the model polls that guest address and arms
+     * the one-shot frame injection only after it becomes non-zero.  The
+     * rx-model generator points this at ld_fm_env+0x14 (0x3ffb8298), the frame
+     * manager program queue that r_ld_fm_prog_push fills from the inquiry
+     * event-start callback.  This replaces the fixed post-boot delay.
+     */
+    uint32_t bb_rx_watch_addr;
+    uint32_t bb_rx_watch_mask;
+    uint32_t bb_rx_watch_offset;
+    uint32_t bb_rx_watch_value;
+    uint64_t bb_rx_watch_poll_ns;
+    bool bb_rx_watch_after_ea;
+    bool bb_rx_watch_armed;
+    bool bb_rx_watch_gated;
+    bool bb_rx_watch_done;
+    uint32_t bb_rx_watch_fires;
+    QEMUTimer *bb_rx_watch_timer;
 } Esp32BtState;
