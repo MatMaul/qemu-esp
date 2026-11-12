@@ -304,7 +304,12 @@ static uint64_t esp32_bt_guest_instructions(void)
 static uint64_t esp32_bt_now_ns(Esp32BtState *s)
 {
     if (esp32_bt_model_clock(s) && s->model_started) {
-        uint64_t count = esp32_bt_guest_instructions();
+        uint64_t count;
+
+        if (s->model_anchor_hold) {
+            return s->model_ns;
+        }
+        count = esp32_bt_guest_instructions();
 
         if (count < s->model_base_count) {
             count = s->model_base_count;
@@ -338,6 +343,7 @@ static void esp32_bt_cancel(Esp32BtState *s, int id, QEMUTimer *timer)
 
 static void esp32_bt_model_advance(Esp32BtState *s);
 static void esp32_bt_model_anchor(Esp32BtState *s, const char *why);
+static void esp32_bt_model_anchor_release(Esp32BtState *s);
 static Esp32BtState *esp32_bt_plugin_state;
 
 static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
@@ -1086,6 +1092,14 @@ static void esp32_bt_model_advance(Esp32BtState *s)
         s->model_base_ns = 0;
         s->model_base_count = esp32_bt_guest_instructions();
     }
+    if (s->model_anchor_hold) {
+        if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >=
+            s->model_anchor_hold_deadline_ns) {
+            esp32_bt_model_anchor_release(s);
+        } else {
+            return;
+        }
+    }
     if (!s->model_idle_armed) {
         s->model_idle_armed = true;
         timer_mod(s->model_idle_timer,
@@ -1122,6 +1136,16 @@ static void esp32_bt_model_idle(void *opaque)
         s->model_started = true;
         s->model_base_ns = 0;
         s->model_base_count = esp32_bt_guest_instructions();
+    }
+    if (s->model_anchor_hold) {
+        if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >=
+            s->model_anchor_hold_deadline_ns) {
+            esp32_bt_model_anchor_release(s);
+        } else {
+            timer_mod(s->model_idle_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+            return;
+        }
     }
     s->model_ns = esp32_bt_now_ns(s);
     esp32_bt_model_process_due(s);
@@ -1229,10 +1253,11 @@ static void esp32_bt_vhci_log(Esp32BtState *s, const char *dir, uint32_t addr,
  * The boot path before the BT model runs under host virtual time, so the
  * instruction count at which the host issues the inquiry varies with host
  * speed.  The controller then programs fine-timer targets relative to that
- * count, which changes the pre-inquiry event phase and sometimes loses the
- * inquiry result.  Restarting the instruction-count base at the inquiry
- * command makes the inquiry event schedule identical on every run.  The
- * absolute clock is still model-defined, not silicon.
+ * count, which changes the pre-inquiry event phase and sometimes lets the
+ * pre-armed periodic slot fire before the inquiry event, losing the result.
+ * Freezing the model clock between the staged HCI_Inquiry and the controller's
+ * target write makes that schedule identical on every run.  The absolute clock
+ * is still model-defined, not silicon.
  */
 static void esp32_bt_model_anchor(Esp32BtState *s, const char *why)
 {
@@ -1245,12 +1270,30 @@ static void esp32_bt_model_anchor(Esp32BtState *s, const char *why)
         return;
     }
     s->model_anchored = true;
+
+    if (strcmp(why, "HCI_Inquiry") == 0) {
+        /*
+         * Freeze the timebase from the staging of HCI_Inquiry until the
+         * controller programs the inquiry fine-timer target.  The controller
+         * computes that target from the clock it reads, so holding the clock
+         * makes the target, and therefore the event phase, identical on every
+         * boot regardless of how the host-timed scheduler interleaved the
+         * command.  Without the hold the pre-armed periodic slot can fire
+         * first once enough instructions have run, which moves the inquiry
+         * event out of its result window.
+         */
+        s->model_ns = esp32_bt_now_ns(s);
+        s->model_anchor_hold = true;
+        s->model_anchor_hold_deadline_ns =
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 500000000;
+        ESP32_BT_LOG(s, "esp32_bt: model clock held at %s\n", why);
+        return;
+    }
+
     /*
-     * Keep the model timebase where it is: the guest has already programmed
-     * fine-timer targets against it, and moving it turns them into far-future
-     * or wrapped events.  Only the synthetic software-tick cadence is re-based,
-     * so bit 16 cannot land at a host-speed-dependent phase inside the inquiry
-     * window.
+     * rx: keep the model timebase where it is and re-base only the synthetic
+     * software-tick cadence, so bit 16 cannot land at a host-speed-dependent
+     * phase.
      */
     s->model_base_count = esp32_bt_guest_instructions();
     s->model_base_ns = s->model_ns;
@@ -1259,25 +1302,29 @@ static void esp32_bt_model_anchor(Esp32BtState *s, const char *why)
     esp32_bt_cancel(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer);
     esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
                    s->bb_sw_interval_ns);
-    /*
-     * Force the next fine-timer expiry to a fixed offset from the inquiry
-     * command.  The guest has programmed a target from the variable boot
-     * phase; re-aiming it at a fixed slot makes the inquiry event-start
-     * callback run at the same point on every boot.  The callback then
-     * programs its own next target normally.
-     */
-    if (strcmp(why, "HCI_Inquiry") == 0) {
-        uint32_t slot = (esp32_bt_ea_now_slot(s) + 8) &
-                        ESP32_BT_EA_WRAP_MASK;
-
-        s->ea_target = slot;
-        s->rwbt[RWBT_EA_TARGET / 4] = slot;
-        s->ea_target_valid = true;
-        s->ea_status_pending = false;
-        s->ea_armed = false;
-        esp32_bt_ea_rearm(s);
-    }
     ESP32_BT_LOG(s, "esp32_bt: model clock anchored at %s\n", why);
+}
+
+/*
+ * Resume the timebase at the frozen model time once the controller programs
+ * the inquiry target.  The instruction count consumed while held is discarded;
+ * the controller computed the target against the frozen clock, so the event
+ * schedule stays relative to the anchor instead of the host-timed interleaving.
+ */
+static void esp32_bt_model_anchor_release(Esp32BtState *s)
+{
+    if (!s->model_anchor_hold) {
+        return;
+    }
+    s->model_anchor_hold = false;
+    s->model_base_count = esp32_bt_guest_instructions();
+    s->model_base_ns = s->model_ns;
+    s->bb_sw_ticks = 0;
+    s->bb_sw_armed = true;
+    esp32_bt_cancel(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer);
+    esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
+                   s->bb_sw_interval_ns);
+    ESP32_BT_LOG(s, "esp32_bt: model clock released at inquiry target write\n");
 }
 
 /*
@@ -1534,6 +1581,8 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         esp32_bt_ea_rearm(s);
         break;
     case RWBT_EA_TARGET:
+        /* The inquiry command programs its first fine target here. */
+        esp32_bt_model_anchor_release(s);
         s->rwbt[off / 4] = v;
         s->ea_target = v;
         s->ea_target_valid = true;
@@ -1756,6 +1805,8 @@ static void esp32_bt_reset(DeviceState *dev)
     s->model_base_ns = 0;
     s->model_base_count = 0;
     s->model_started = false;
+    s->model_anchor_hold = false;
+    s->model_anchor_hold_deadline_ns = 0;
     s->model_accesses = 0;
     s->vhci_rx_key = 0;
     s->vhci_tx_key = 0;

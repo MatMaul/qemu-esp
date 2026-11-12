@@ -96,6 +96,16 @@ typedef struct Esp32BtState {
     uint64_t bt_clock_idle_step_ns;
     bool model_started;
     bool model_anchored;
+    /*
+     * HCI_Inquiry hold: freeze the model clock from the anchor until the
+     * controller programs the inquiry fine-timer target (0x0b8 write) or the
+     * host-virtual deadline expires.  The host-timed scheduler otherwise runs
+     * a variable number of instructions between the VHCI staging and that
+     * programming, which can let the pre-armed periodic slot fire first and
+     * move the inquiry event out of its window.
+     */
+    bool model_anchor_hold;
+    uint64_t model_anchor_hold_deadline_ns;
     uint64_t model_ns;
     uint64_t model_base_ns;
     uint64_t model_base_count;
