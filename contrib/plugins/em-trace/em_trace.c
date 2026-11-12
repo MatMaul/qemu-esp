@@ -62,6 +62,8 @@ typedef struct {
 
 static FILE *out;
 static bool out_owned;
+static FILE *events;
+static bool events_owned;
 static GMutex lock;
 static bool want_value = true;
 static bool want_hist;
@@ -390,6 +392,18 @@ static void vcpu_mem(unsigned int cpu_index, qemu_plugin_meminfo_t info,
     } else {
         fprintf(out, " val=?\n");
     }
+    if (events) {
+        fprintf(events, "{\"v\":1,\"source\":\"qemu\",\"t\":\"em\","
+                "\"seq\":%" PRIu64
+                ",\"pc\":%" PRIu64 ",\"addr\":%" PRIu64
+                ",\"off\":%" PRIu64 ",\"sz\":%u,\"op\":\"%c\"",
+                seq_no, pc, vaddr, off, size, store ? 'W' : 'R');
+        if (have_val) {
+            fprintf(events, ",\"value\":%" PRIu64 "}\n", val);
+        } else {
+            fputs(",\"value\":null}\n", events);
+        }
+    }
     if (want_hist) {
         hist_update(off, size, store, have_val, val);
     }
@@ -477,10 +491,18 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             n_seen, n_logged, n_reads, n_writes, em_lo, em_hi,
             value_ready ? "on" : "off");
     fflush(out);
+    if (events) {
+        fflush(events);
+    }
     if (out_owned) {
         fclose(out);
         out = NULL;
         out_owned = false;
+    }
+    if (events_owned) {
+        fclose(events);
+        events = NULL;
+        events_owned = false;
     }
     g_mutex_unlock(&lock);
 }
@@ -528,6 +550,7 @@ static void usage(void)
         "  value=on|off       best-effort value recovery (default on)\n"
         "  hist=on|off        per-offset histogram at exit (default off)\n"
         "  out=PATH           write the trace here (default stderr)\n"
+        "  events=PATH        write typed NDJSON records here (default off)\n"
         "  vaddr=on|off       filter on vaddr (default on) or QEMU phys\n"
         "  verbose            print setup diagnostics to stderr\n");
 }
@@ -595,6 +618,13 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                 return -1;
             }
             out_owned = true;
+        } else if (g_strcmp0(key, "events") == 0 && val) {
+            events = fopen(val, "w");
+            if (!events) {
+                fprintf(stderr, "em-trace: cannot open events file %s\n", val);
+                return -1;
+            }
+            events_owned = true;
         } else if (g_strcmp0(key, "sample") == 0 && val) {
             sample_left = parse_u64(val);
         } else if (g_strcmp0(key, "near") == 0 && val) {

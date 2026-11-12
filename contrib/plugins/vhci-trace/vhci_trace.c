@@ -110,6 +110,9 @@ static int arg_len_index = 3;
 
 static FILE *out;
 static bool out_owned;
+static FILE *events;
+static bool events_owned;
+static uint64_t event_seq;
 static bool verbose;
 static GMutex lock;
 static uint64_t samples;
@@ -324,6 +327,54 @@ static uint32_t packet_key(const uint8_t *buf, uint32_t len)
     return h ^ (len * 2654435761u);
 }
 
+static void events_hci(const char *dir, const uint8_t *buf, uint32_t len,
+                       uint32_t n)
+{
+    uint32_t header = 0;
+    uint32_t i;
+
+    if (!events) {
+        return;
+    }
+    if (n > 0) {
+        switch (buf[0]) {
+        case 0x01:  /* command: type + 16-bit opcode */
+        case 0x03:  /* SCO: type + handle/length */
+            header = 3;
+            break;
+        case 0x04:  /* event: type + event code */
+            header = 2;
+            break;
+        case 0x02:  /* ACL: type + handle/length */
+            header = 4;
+            break;
+        default:
+            header = 0;
+            break;
+        }
+    }
+    fprintf(events, "{\"v\":1,\"source\":\"qemu\",\"t\":\"hci\","
+            "\"seq\":%" PRIu64
+            ",\"dir\":\"%s\",\"len\":%u,\"bytes\":[",
+            ++event_seq, dir, len);
+    for (i = 0; i < n; i++) {
+        fprintf(events, "%s%u", i ? "," : "", (unsigned)buf[i]);
+    }
+    fputs("],\"payload\":[", events);
+    for (i = header; i < n; i++) {
+        fprintf(events, "%s%u", i > header ? "," : "", (unsigned)buf[i]);
+    }
+    fputc(']', events);
+    if (n >= 1 && buf[0] == 0x01 && len >= 3) {
+        fprintf(events, ",\"opcode\":%u",
+                (unsigned)(buf[1] | (buf[2] << 8)));
+    }
+    if (n >= 1 && buf[0] == 0x04 && len >= 2) {
+        fprintf(events, ",\"event\":%u", (unsigned)buf[1]);
+    }
+    fputs("}\n", events);
+}
+
 static void emit(const char *dir, uint64_t addr, uint32_t len)
 {
     uint8_t buf[256];
@@ -344,6 +395,7 @@ static void emit(const char *dir, uint64_t addr, uint32_t len)
         fprintf(out, " 0x%02x", buf[i]);
     }
     fprintf(out, "\n");
+    events_hci(dir, buf, len, n);
     fflush(out);
 }
 
@@ -425,6 +477,7 @@ static void vcpu_send(unsigned int cpu_index, void *udata)
 static void vcpu_isr(unsigned int cpu_index, void *udata)
 {
     uint32_t status, current, queue;
+    uint16_t desc[7];
     unsigned int i;
 
     (void)cpu_index;
@@ -447,10 +500,21 @@ static void vcpu_isr(unsigned int cpu_index, void *udata)
             isr_addr, status, current, queue);
     fprintf(out, "RXFM desc0=");
     for (i = 0; i < 7; i++) {
-        fprintf(out, "%s%04x", i ? " " : "",
-                (unsigned)u16_at(isr_desc + 2 * i));
+        desc[i] = u16_at(isr_desc + 2 * i);
+        fprintf(out, "%s%04x", i ? " " : "", (unsigned)desc[i]);
     }
     fprintf(out, "\n");
+    if (events) {
+        fprintf(events, "{\"v\":1,\"source\":\"qemu\",\"t\":\"rxfm\","
+                "\"seq\":%" PRIu64
+                ",\"hit\":1,\"pc\":%" PRIu64
+                ",\"status\":%u,\"current\":%u,\"fmq\":%u,\"desc0\":[",
+                ++event_seq, isr_addr, status, current, queue);
+        for (i = 0; i < 7; i++) {
+            fprintf(events, "%s%u", i ? "," : "", (unsigned)desc[i]);
+        }
+        fputs("]}\n", events);
+    }
     fflush(out);
     g_mutex_unlock(&lock);
 }
@@ -493,6 +557,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         fclose(out);
         out = NULL;
     }
+    if (events_owned && events) {
+        fclose(events);
+        events = NULL;
+        events_owned = false;
+    }
 }
 
 static void usage(void)
@@ -501,6 +570,7 @@ static void usage(void)
             "vhci-trace options:\n"
             "  env=ADDR            guest address of the vhci_env_p pointer (required)\n"
             "  out=PATH            write H2C/C2H/RXFM lines here (default stderr)\n"
+            "  events=PATH         write typed NDJSON records here (default off)\n"
             "  stage=ADDR          host VHCI staging function entry (H2C store hook)\n"
             "  stage-end=ADDR      end of the staging function (exclusive)\n"
             "  send=ADDR           vhci_send entry (C2H register hook)\n"
@@ -543,6 +613,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                 return -1;
             }
             out_owned = true;
+        } else if (g_strcmp0(key, "events") == 0 && val) {
+            events = fopen(val, "w");
+            if (!events) {
+                fprintf(stderr, "vhci-trace: cannot open events file %s\n",
+                        val);
+                return -1;
+            }
+            events_owned = true;
         } else if (g_strcmp0(key, "stage") == 0 && val) {
             stage_addr = g_ascii_strtoull(val, NULL, 0);
         } else if (g_strcmp0(key, "stage-end") == 0 && val) {

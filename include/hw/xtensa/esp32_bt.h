@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdio.h>
+
 #include "hw/hw.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
@@ -56,6 +58,14 @@ typedef struct Esp32BtState {
 
     /* Opt-in device-only trace; see ESP32_BT_LOG() in esp32_bt.c. */
     bool bt_trace;
+
+    /*
+     * Opt-in NDJSON sidecar (`bt-events=PATH`).  It is an additional canonical
+     * view of the same events; the historical text log is unchanged.
+     */
+    char *bt_events;
+    FILE *bt_events_fp;
+    uint64_t bt_events_seq;
 
     /*
      * Opt-in VHCI capture.  `vhci-env` is the guest address of

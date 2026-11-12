@@ -155,17 +155,107 @@
 #define BT_WAKEUP_SELF_CLEAR 0x80000000u
 
 /*
- * Device log helper.  With bt-trace=on the device writes its own lines to the
+ * Device log helpers.  With bt-trace=on the device writes its own lines to the
  * -D log without enabling QEMU's global -d unimp mask, so the RX-model
  * generator can trace only the BT block and keep the guest at full speed.
  * Without the property the historical -d unimp behaviour is unchanged.
+ *
+ * When `bt-events=PATH` is set, ESP32_BT_LOG() additionally writes one typed
+ * NDJSON record per semantic line to that sidecar.  MMIO sites use
+ * ESP32_BT_TEXT_LOG() so they can emit their own typed record instead of a
+ * duplicate text-shaped `bt` record.
  */
-#define ESP32_BT_LOG(s, ...) do { \
+static void esp32_bt_events_json_string(FILE *fp, const char *text)
+{
+    const unsigned char *p;
+
+    for (p = (const unsigned char *)text; *p; p++) {
+        switch (*p) {
+        case '"':
+            fputs("\\\"", fp);
+            break;
+        case '\\':
+            fputs("\\\\", fp);
+            break;
+        case '\n':
+            fputs("\\n", fp);
+            break;
+        case '\r':
+            fputs("\\r", fp);
+            break;
+        case '\t':
+            fputs("\\t", fp);
+            break;
+        default:
+            if (*p < 0x20) {
+                fprintf(fp, "\\u%04x", *p);
+            } else {
+                fputc(*p, fp);
+            }
+            break;
+        }
+    }
+}
+
+static void esp32_bt_events_log(Esp32BtState *s, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
+
+static void esp32_bt_events_log(Esp32BtState *s, const char *fmt, ...)
+{
+    char msg[1024];
+    const char *text = msg;
+    va_list ap;
+    int n;
+
+    if (!s->bt_events_fp) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        return;
+    }
+    if (n >= (int)sizeof(msg)) {
+        msg[sizeof(msg) - 1] = '\0';
+    }
+    if (strncmp(text, "esp32_bt: ", 10) == 0) {
+        text += 10;
+    }
+    fprintf(s->bt_events_fp,
+            "{\"v\":1,\"source\":\"qemu\",\"t\":\"bt\","
+            "\"seq\":%" PRIu64 ",\"message\":\"",
+            ++s->bt_events_seq);
+    esp32_bt_events_json_string(s->bt_events_fp, text);
+    fputs("\"}\n", s->bt_events_fp);
+}
+
+static void esp32_bt_events_mmio(Esp32BtState *s, const char *dev, bool write,
+                                 uint32_t off, uint32_t value)
+{
+    if (!s->bt_events_fp) {
+        return;
+    }
+    fprintf(s->bt_events_fp,
+            "{\"v\":1,\"source\":\"qemu\",\"t\":\"mmio\","
+            "\"seq\":%" PRIu64 ",\"dev\":\"%s\","
+            "\"op\":\"%s\",\"off\":%u,\"value\":%u}\n",
+            ++s->bt_events_seq, dev, write ? "write" : "read", off, value);
+}
+
+#define ESP32_BT_TEXT_LOG(s, ...) do { \
     if ((s)->bt_trace) { \
         qemu_log(__VA_ARGS__); \
     } else { \
         qemu_log_mask(LOG_UNIMP, __VA_ARGS__); \
     } \
+} while (0)
+
+#define ESP32_BT_LOG(s, ...) do { \
+    if ((s)->bt_events_fp) { \
+        esp32_bt_events_log((s), __VA_ARGS__); \
+    } \
+    ESP32_BT_TEXT_LOG((s), __VA_ARGS__); \
 } while (0)
 
 /*
@@ -279,6 +369,12 @@ static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
 static const char *esp32_bt_block(uint32_t off)
 {
     return off >= RWBLE_BASE ? "RWBLE" : "RWBT ";
+}
+
+/* Same split without the text-log padding; used by the NDJSON sidecar. */
+static const char *esp32_bt_block_name(uint32_t off)
+{
+    return off >= RWBLE_BASE ? "RWBLE" : "RWBT";
 }
 
 static Property esp32_bt_properties[];
@@ -1044,6 +1140,56 @@ static uint32_t esp32_bt_vhci_hash(const uint8_t *buf, uint32_t len)
     return h ^ (len * 2654435761u);
 }
 
+static void esp32_bt_events_hci(Esp32BtState *s, const char *dir,
+                                uint32_t len, const uint8_t *buf, uint32_t n)
+{
+    uint32_t header = 0;
+    uint32_t i;
+
+    if (!s->bt_events_fp) {
+        return;
+    }
+    if (n > 0) {
+        switch (buf[0]) {
+        case 0x01:  /* command: type + 16-bit opcode */
+        case 0x03:  /* SCO: type + handle/length */
+            header = 3;
+            break;
+        case 0x04:  /* event: type + event code */
+            header = 2;
+            break;
+        case 0x02:  /* ACL: type + handle/length */
+            header = 4;
+            break;
+        default:
+            header = 0;
+            break;
+        }
+    }
+    fprintf(s->bt_events_fp,
+            "{\"v\":1,\"source\":\"qemu\",\"t\":\"hci\","
+            "\"seq\":%" PRIu64 ",\"dir\":\"%s\","
+            "\"len\":%u,\"bytes\":[",
+            ++s->bt_events_seq, dir, len);
+    for (i = 0; i < n; i++) {
+        fprintf(s->bt_events_fp, "%s%u", i ? "," : "", (unsigned)buf[i]);
+    }
+    fputs("],\"payload\":[", s->bt_events_fp);
+    for (i = header; i < n; i++) {
+        fprintf(s->bt_events_fp, "%s%u", i > header ? "," : "",
+                (unsigned)buf[i]);
+    }
+    fputc(']', s->bt_events_fp);
+    if (n >= 1 && buf[0] == 0x01 && len >= 3) {
+        fprintf(s->bt_events_fp, ",\"opcode\":%u",
+                (unsigned)(buf[1] | (buf[2] << 8)));
+    }
+    if (n >= 1 && buf[0] == 0x04 && len >= 2) {
+        fprintf(s->bt_events_fp, ",\"event\":%u", (unsigned)buf[1]);
+    }
+    fputs("}\n", s->bt_events_fp);
+}
+
 static void esp32_bt_vhci_log(Esp32BtState *s, const char *dir, uint32_t addr,
                               uint32_t len)
 {
@@ -1074,6 +1220,7 @@ static void esp32_bt_vhci_log(Esp32BtState *s, const char *dir, uint32_t addr,
         qemu_log(" 0x%02x", buf[i]);
     }
     qemu_log("\n");
+    esp32_bt_events_hci(s, dir, len, buf, n);
 }
 
 /*
@@ -1298,8 +1445,10 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
         break;
     }
 
-    ESP32_BT_LOG(s, "esp32_bt: %s read  %04x -> %08x\n",
-                  esp32_bt_block(off), (uint32_t)off, r);
+    ESP32_BT_TEXT_LOG(s, "esp32_bt: %s read  %04x -> %08x\n",
+                      esp32_bt_block(off), (uint32_t)off, r);
+    esp32_bt_events_mmio(s, esp32_bt_block_name(off), false,
+                         (uint32_t)off, r);
     log_mmio_access(ESP32_BT_RWBT_BASE + off, r, false);
     esp32_bt_vhci_sample(s);
     return r;
@@ -1480,8 +1629,10 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         break;
     }
 
-    ESP32_BT_LOG(s, "esp32_bt: %s write %04x <- %08x\n",
-                  esp32_bt_block(off), (uint32_t)off, v);
+    ESP32_BT_TEXT_LOG(s, "esp32_bt: %s write %04x <- %08x\n",
+                      esp32_bt_block(off), (uint32_t)off, v);
+    esp32_bt_events_mmio(s, esp32_bt_block_name(off), true,
+                         (uint32_t)off, v);
     log_mmio_access(ESP32_BT_RWBT_BASE + off, v, true);
     esp32_bt_vhci_sample(s);
 
@@ -1521,8 +1672,9 @@ static uint64_t esp32_bt_bb_read(void *opaque, hwaddr addr, unsigned int size)
 
     esp32_bt_model_advance(s);
 
-    ESP32_BT_LOG(s, "esp32_bt: BB    read  %04x -> %08x\n",
-                  (uint32_t)off, r);
+    ESP32_BT_TEXT_LOG(s, "esp32_bt: BB    read  %04x -> %08x\n",
+                      (uint32_t)off, r);
+    esp32_bt_events_mmio(s, "BB", false, (uint32_t)off, r);
     log_mmio_access(ESP32_BT_BB_BASE + off, r, false);
     return r;
 }
@@ -1536,8 +1688,9 @@ static void esp32_bt_bb_write(void *opaque, hwaddr addr,
 
     esp32_bt_model_advance(s);
     s->bb[off / 4] = v;
-    ESP32_BT_LOG(s, "esp32_bt: BB    write %04x <- %08x\n",
-                  (uint32_t)off, v);
+    ESP32_BT_TEXT_LOG(s, "esp32_bt: BB    write %04x <- %08x\n",
+                      (uint32_t)off, v);
+    esp32_bt_events_mmio(s, "BB", true, (uint32_t)off, v);
     log_mmio_access(ESP32_BT_BB_BASE + off, v, true);
 }
 
@@ -1669,16 +1822,44 @@ static void esp32_bt_init(Object *obj)
                                        esp32_bt_model_idle, s);
 }
 
+static void esp32_bt_realize(DeviceState *dev, Error **errp)
+{
+    Esp32BtState *s = ESP32_BT(dev);
+
+    if (!s->bt_events || s->bt_events[0] == '\0') {
+        return;
+    }
+    s->bt_events_fp = fopen(s->bt_events, "w");
+    if (!s->bt_events_fp) {
+        error_setg_errno(errp, errno, "esp32_bt: cannot open %s",
+                         s->bt_events);
+    }
+}
+
+static void esp32_bt_unrealize(DeviceState *dev)
+{
+    Esp32BtState *s = ESP32_BT(dev);
+
+    if (s->bt_events_fp) {
+        fclose(s->bt_events_fp);
+        s->bt_events_fp = NULL;
+    }
+}
+
 static void esp32_bt_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->reset = esp32_bt_reset;
+    dc->realize = esp32_bt_realize;
+    dc->unrealize = esp32_bt_unrealize;
     device_class_set_props(dc, esp32_bt_properties);
 }
 
 static Property esp32_bt_properties[] = {
     /* Trace only this device to the -D log without -d unimp. */
     DEFINE_PROP_BOOL("bt-trace", Esp32BtState, bt_trace, false),
+    /* Optional NDJSON sidecar path; empty disables it. */
+    DEFINE_PROP_STRING("bt-events", Esp32BtState, bt_events),
 
     /*
      * Opt-in deterministic model clock.  `host` (default) keeps
