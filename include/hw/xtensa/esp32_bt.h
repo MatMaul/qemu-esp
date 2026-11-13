@@ -186,6 +186,15 @@ typedef struct Esp32BtState {
     uint32_t bb_rx_activity;
     uint32_t bb_rx_packet_type;
     uint32_t bb_rx_payload_len;
+    /*
+     * Optional explicit payload and descriptor length flags.  When
+     * bb_rx_payload is a non-empty hex string it replaces the built-in FHS
+     * pattern and its byte count overrides bb_rx_payload_len.  bb_rx_len_flags
+     * is ORed into the low two bits of descriptor +0x06; the ACL DM1/DV path in
+     * ld_acl_rx requires those bits to be 3 (spec/04 §3.3).
+     */
+    char *bb_rx_payload;
+    uint32_t bb_rx_len_flags;
     uint32_t bb_rx_rssi;
     uint32_t bb_rx_status_low;
     uint32_t bb_rx_status_bit;

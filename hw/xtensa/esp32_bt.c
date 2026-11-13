@@ -553,11 +553,53 @@ static bool esp32_bt_rxdesc_valid(uint32_t off)
            ((off - RWBT_RXDESC_BASE) % RWBT_RXDESC_STRIDE) == 0;
 }
 
+#define ESP32_BT_RX_MAX_PAYLOAD 1024
+
+/*
+ * Decode a hex payload property ("0102" or "01:02").  Returns the number of
+ * bytes written, or 0 when the string is empty, odd-length or malformed.
+ */
+static uint32_t esp32_bt_parse_hex_payload(const char *text, uint8_t *out,
+                                           uint32_t max)
+{
+    uint32_t n = 0;
+    int hi = -1;
+
+    for (; *text; text++) {
+        int v;
+
+        if (*text == ':' || *text == ' ' || *text == '-') {
+            continue;
+        }
+        if (*text >= '0' && *text <= '9') {
+            v = *text - '0';
+        } else if (*text >= 'a' && *text <= 'f') {
+            v = *text - 'a' + 10;
+        } else if (*text >= 'A' && *text <= 'F') {
+            v = *text - 'A' + 10;
+        } else {
+            return 0;
+        }
+        if (hi < 0) {
+            hi = v;
+        } else {
+            if (n >= max) {
+                return 0;
+            }
+            out[n++] = (uint8_t)((hi << 4) | v);
+            hi = -1;
+        }
+    }
+    return hi < 0 ? n : 0;
+}
+
 static void esp32_bt_rx_frame_inject(void *opaque)
 {
     Esp32BtState *s = ESP32_BT(opaque);
     uint32_t desc, next, payload_off, staging_off;
-    uint32_t i, len;
+    uint32_t i, len, pattern_len;
+    const uint8_t *pattern = esp32_bt_rx_pattern;
+    uint8_t hex_payload[ESP32_BT_RX_MAX_PAYLOAD];
     uint16_t act_word;
 
     s->bb_rx_armed = false;
@@ -589,7 +631,25 @@ static void esp32_bt_rx_frame_inject(void *opaque)
 
     payload_off = esp32_bt_em_read16(s, desc + 0x0a);
     staging_off = esp32_bt_em_read16(s, desc + 0x0c);
-    len = MIN(s->bb_rx_payload_len, sizeof(esp32_bt_rx_pattern));
+
+    pattern_len = sizeof(esp32_bt_rx_pattern);
+    if (s->bb_rx_payload && s->bb_rx_payload[0]) {
+        uint32_t n = esp32_bt_parse_hex_payload(s->bb_rx_payload,
+                                                hex_payload,
+                                                sizeof(hex_payload));
+
+        if (n == 0) {
+            ESP32_BT_LOG(s,
+                          "esp32_bt: RX inject skipped: invalid "
+                          "bb-rx-payload\n");
+            return;
+        }
+        pattern = hex_payload;
+        pattern_len = n;
+        len = n;
+    } else {
+        len = MIN(s->bb_rx_payload_len, pattern_len);
+    }
 
     /*
      * DMA order: payload first, then the descriptor words, then the owner
@@ -597,11 +657,10 @@ static void esp32_bt_rx_frame_inject(void *opaque)
      * final state, but the trace records this order for the claim.
      */
     for (i = 0; i < len; i++) {
-        esp32_bt_em_write8(s, payload_off + i, esp32_bt_rx_pattern[i]);
+        esp32_bt_em_write8(s, payload_off + i, pattern[i]);
     }
     for (i = 0; i < 20; i++) {
-        esp32_bt_em_write8(s, staging_off + i,
-                           i < len ? esp32_bt_rx_pattern[i] : 0);
+        esp32_bt_em_write8(s, staging_off + i, i < len ? pattern[i] : 0);
     }
 
     act_word = (uint16_t)(((s->bb_rx_activity & 0x1fu) << 11) |
@@ -610,7 +669,9 @@ static void esp32_bt_rx_frame_inject(void *opaque)
     esp32_bt_em_write16(s, desc + 0x02, act_word);
     esp32_bt_em_write16(s, desc + 0x04,
                         (uint16_t)((s->bb_rx_packet_type & 0x0fu) << 3));
-    esp32_bt_em_write16(s, desc + 0x06, (uint16_t)((len & 0xffu) << 3));
+    esp32_bt_em_write16(s, desc + 0x06,
+                        (uint16_t)(((len & 0x3ffu) << 3) |
+                                   (s->bb_rx_len_flags & 0x3u)));
     /*
      * +0x08: r_ld_inq_frm_cbk copies its low byte to the result record, which
      * r_modules_funcs_p+0xc4 emits as the Inquiry Result with RSSI byte.
@@ -2111,6 +2172,9 @@ static Property esp32_bt_properties[] = {
                        bb_rx_packet_type, 2),
     DEFINE_PROP_UINT32("bb-rx-payload-len", Esp32BtState,
                        bb_rx_payload_len, 18),
+    DEFINE_PROP_STRING("bb-rx-payload", Esp32BtState, bb_rx_payload),
+    DEFINE_PROP_UINT32("bb-rx-len-flags", Esp32BtState,
+                       bb_rx_len_flags, 0),
     DEFINE_PROP_UINT32("bb-rx-rssi", Esp32BtState,
                        bb_rx_rssi, 0),
     DEFINE_PROP_UINT32("bb-rx-status-low", Esp32BtState,
