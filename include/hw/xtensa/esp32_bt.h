@@ -263,4 +263,34 @@ typedef struct Esp32BtState {
     bool bb_rx_watch_done;
     uint32_t bb_rx_watch_fires;
     QEMUTimer *bb_rx_watch_timer;
+
+    /*
+     * Opt-in baseband TX completion model.  Disabled by default.
+     *
+     * The BR/EDR hardware TX control block is an array of 10-byte records at
+     * EM 0x23ba, indexed by 10*(2*link_id + queue) (spec/04 §3.2b).  Software
+     * marks a record pending by setting bit 15 of its +0x00 link word; the
+     * ROM's ld_acl_tx() sends only records whose bit 15 is set and the
+     * baseband clears it when the packet is transmitted (spec/04 §3.2b).
+     * This model polls one guest link word, performs that write-back on the
+     * configured owner bit and raises the selected RWBT/RWBLE status bit, so
+     * the CPU-visible half of the owner/complete handshake is observable.
+     * The address, bits, delays and target block are all properties: the
+     * model is a harness aid, not a statement about silicon polarity.
+     */
+    bool bb_tx_inject;
+    uint32_t bb_tx_watch_addr;
+    uint32_t bb_tx_watch_mask;
+    uint32_t bb_tx_watch_value;
+    uint32_t bb_tx_owner_bit;
+    uint32_t bb_tx_status_bit;
+    bool bb_tx_rwble;
+    uint64_t bb_tx_poll_ns;
+    uint64_t bb_tx_delay_ns;
+    bool bb_tx_watch_armed;
+    bool bb_tx_armed;
+    bool bb_tx_fired;
+    uint32_t bb_tx_completions;
+    QEMUTimer *bb_tx_watch_timer;
+    QEMUTimer *bb_tx_timer;
 } Esp32BtState;

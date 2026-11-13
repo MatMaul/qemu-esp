@@ -278,6 +278,8 @@ enum {
     ESP32_BT_TMR_WAKEUP_START,
     ESP32_BT_TMR_WAKEUP_END,
     ESP32_BT_TMR_RWBLE_PROBE,
+    ESP32_BT_TMR_TX_WATCH,
+    ESP32_BT_TMR_TX_COMPLETE,
     ESP32_BT_TMR_COUNT,
 };
 
@@ -910,6 +912,104 @@ static void esp32_bt_rx_inject_arm(Esp32BtState *s)
 }
 
 /*
+ * Opt-in baseband TX completion model.
+ *
+ * The BR/EDR TX control block is an array of 10-byte records at EM 0x23ba,
+ * indexed by 10*(2*link_id + queue) (spec/04 §3.2b).  Software posts a packet
+ * by setting bit 15 of the record's +0x00 link word; ld_acl_tx() at
+ * 0x4002ffdc sends only a record whose bit 15 is set, and the real baseband
+ * clears that bit when the packet leaves the slot.  The clear is a
+ * hardware-owned write that CPU-only EM tracing cannot see, so this model
+ * polls one guest link word, clears the configured owner bit after a
+ * configurable transmission delay and raises the selected status bit.  The
+ * address, bit positions and target block are properties: another ring or
+ * another image can be modelled without editing the device, and nothing here
+ * claims the real silicon polarity.
+ */
+static void esp32_bt_tx_complete(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t before = 0, after;
+    uint32_t mask;
+
+    s->bb_tx_armed = false;
+    if (!s->bb_tx_inject || s->bb_tx_fired) {
+        return;
+    }
+    s->bb_tx_fired = true;
+
+    address_space_read(&address_space_memory, s->bb_tx_watch_addr,
+                       MEMTXATTRS_UNSPECIFIED, &before, sizeof(before));
+    mask = 1u << (s->bb_tx_owner_bit & 31u);
+    after = before & ~mask;
+    address_space_write(&address_space_memory, s->bb_tx_watch_addr,
+                        MEMTXATTRS_UNSPECIFIED, &after, sizeof(after));
+
+    if (s->bb_tx_rwble) {
+        s->rwble_irq_status |= 1u << (s->bb_tx_status_bit & 31u);
+    } else {
+        s->rwbt_irq_status |= 1u << (s->bb_tx_status_bit & 31u);
+    }
+    s->bb_tx_completions++;
+
+    ESP32_BT_LOG(s,
+                  "esp32_bt: TX complete n=%u addr=%08x owner=bit%u "
+                  "before=%08x after=%08x status=%08x block=%s\n",
+                  s->bb_tx_completions, s->bb_tx_watch_addr,
+                  s->bb_tx_owner_bit, before, after,
+                  s->bb_tx_rwble ? s->rwble_irq_status : s->rwbt_irq_status,
+                  s->bb_tx_rwble ? "RWBLE" : "RWBT");
+    esp32_bt_update_irqs(s);
+}
+
+static void esp32_bt_tx_watch_poll(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t v = 0;
+
+    if (!s->bb_tx_inject || s->bb_tx_fired) {
+        s->bb_tx_watch_armed = false;
+        return;
+    }
+
+    address_space_read(&address_space_memory, s->bb_tx_watch_addr,
+                       MEMTXATTRS_UNSPECIFIED, &v, sizeof(v));
+    if ((v & s->bb_tx_watch_mask) ==
+        (s->bb_tx_watch_value & s->bb_tx_watch_mask) &&
+        (v & s->bb_tx_watch_mask) != 0) {
+        s->bb_tx_watch_armed = false;
+        s->bb_tx_armed = true;
+        ESP32_BT_LOG(s,
+                      "esp32_bt: TX watch fired addr=%08x value=%08x "
+                      "mask=%08x delay=%" PRIu64 "ns clock=%u\n",
+                      s->bb_tx_watch_addr, v, s->bb_tx_watch_mask,
+                      s->bb_tx_delay_ns, esp32_bt_bt_clk(s));
+        esp32_bt_sched(s, ESP32_BT_TMR_TX_COMPLETE, s->bb_tx_timer,
+                       s->bb_tx_delay_ns);
+        return;
+    }
+
+    esp32_bt_sched(s, ESP32_BT_TMR_TX_WATCH, s->bb_tx_watch_timer,
+                   s->bb_tx_poll_ns);
+}
+
+static void esp32_bt_tx_watch_arm_start(Esp32BtState *s)
+{
+    if (!s->bb_tx_inject || s->bb_tx_watch_addr == 0 ||
+        s->bb_tx_watch_armed || s->bb_tx_armed || s->bb_tx_fired) {
+        return;
+    }
+    s->bb_tx_watch_armed = true;
+    ESP32_BT_LOG(s,
+                  "esp32_bt: TX watch armed addr=%08x mask=%08x value=%08x "
+                  "poll=%" PRIu64 "ns clock=%u\n",
+                  s->bb_tx_watch_addr, s->bb_tx_watch_mask,
+                  s->bb_tx_watch_value, s->bb_tx_poll_ns,
+                  esp32_bt_bt_clk(s));
+    esp32_bt_tx_watch_poll(s);
+}
+
+/*
  * Sleep/wakeup synthesis.
  *
  * Sequence:
@@ -1042,6 +1142,12 @@ static void esp32_bt_fire_one(Esp32BtState *s, int id)
         break;
     case ESP32_BT_TMR_RWBLE_PROBE:
         esp32_bt_rwble_probe_fire(s);
+        break;
+    case ESP32_BT_TMR_TX_WATCH:
+        esp32_bt_tx_watch_poll(s);
+        break;
+    case ESP32_BT_TMR_TX_COMPLETE:
+        esp32_bt_tx_complete(s);
         break;
     }
 }
@@ -1410,6 +1516,7 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
     esp32_bt_model_advance(s);
     esp32_bt_rwble_probe_arm_start(s);
     esp32_bt_rx_watch_arm_start(s);
+    esp32_bt_tx_watch_arm_start(s);
 
     switch (off) {
     case RWBT_CTRL:
@@ -1512,6 +1619,7 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     esp32_bt_model_advance(s);
     esp32_bt_rwble_probe_arm_start(s);
     esp32_bt_rx_watch_arm_start(s);
+    esp32_bt_tx_watch_arm_start(s);
 
     switch (off) {
     case RWBT_CTRL:
@@ -1614,8 +1722,15 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
             timer_del(s->bb_sw_timer);
             timer_del(s->bb_fine_timer);
             timer_del(s->bb_rx_watch_timer);
+            timer_del(s->bb_tx_watch_timer);
+            timer_del(s->bb_tx_timer);
             for (int i = 0; i < ESP32_BT_TMR_COUNT; i++) {
                 s->model_active[i] = false;
+            }
+            s->bb_tx_watch_armed = false;
+            s->bb_tx_armed = false;
+            if (s->bb_tx_inject && !s->bb_tx_fired) {
+                esp32_bt_tx_watch_arm_start(s);
             }
             if (s->bb_sw_inject && s->bb_sw_armed) {
                 esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
@@ -1720,6 +1835,7 @@ static uint64_t esp32_bt_bb_read(void *opaque, hwaddr addr, unsigned int size)
     uint32_t r = s->bb[off / 4];
 
     esp32_bt_model_advance(s);
+    esp32_bt_tx_watch_arm_start(s);
 
     ESP32_BT_TEXT_LOG(s, "esp32_bt: BB    read  %04x -> %08x\n",
                       (uint32_t)off, r);
@@ -1736,6 +1852,7 @@ static void esp32_bt_bb_write(void *opaque, hwaddr addr,
     uint32_t v = (uint32_t)value;
 
     esp32_bt_model_advance(s);
+    esp32_bt_tx_watch_arm_start(s);
     s->bb[off / 4] = v;
     ESP32_BT_TEXT_LOG(s, "esp32_bt: BB    write %04x <- %08x\n",
                       (uint32_t)off, v);
@@ -1801,6 +1918,12 @@ static void esp32_bt_reset(DeviceState *dev)
     s->bb_rx_watch_gated = false;
     s->bb_rx_watch_done = false;
     s->bb_rx_watch_fires = 0;
+    esp32_bt_cancel(s, ESP32_BT_TMR_TX_WATCH, s->bb_tx_watch_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_TX_COMPLETE, s->bb_tx_timer);
+    s->bb_tx_watch_armed = false;
+    s->bb_tx_armed = false;
+    s->bb_tx_fired = false;
+    s->bb_tx_completions = 0;
     s->model_ns = 0;
     s->model_base_ns = 0;
     s->model_base_count = 0;
@@ -1869,6 +1992,10 @@ static void esp32_bt_init(Object *obj)
                                     esp32_bt_ea_fire, s);
     s->bb_rx_watch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                         esp32_bt_rx_watch_poll, s);
+    s->bb_tx_watch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        esp32_bt_tx_watch_poll, s);
+    s->bb_tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  esp32_bt_tx_complete, s);
     s->model_idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        esp32_bt_model_idle, s);
 }
@@ -2022,6 +2149,31 @@ static Property esp32_bt_properties[] = {
                        bb_rx_watch_poll_ns, 200000),
     DEFINE_PROP_BOOL("bb-rx-watch-after-ea", Esp32BtState,
                      bb_rx_watch_after_ea, false),
+
+    /*
+     * Opt-in baseband TX completion model.  Disabled by default.  It polls the
+     * guest link word at bb-tx-watch-addr and, when its masked value matches
+     * bb-tx-watch-value (non-zero), clears bb-tx-owner-bit and raises
+     * bb-tx-status-bit in RWBT (or RWBLE when bb-tx-rwble=on).  The default
+     * watch target is the first BR/EDR TX link word at EM 0x23ba with owner
+     * bit 15 set (spec/04 §3.2b).
+     */
+    DEFINE_PROP_BOOL("bb-tx-inject", Esp32BtState, bb_tx_inject, false),
+    DEFINE_PROP_UINT32("bb-tx-watch-addr", Esp32BtState,
+                       bb_tx_watch_addr, 0),
+    DEFINE_PROP_UINT32("bb-tx-watch-mask", Esp32BtState,
+                       bb_tx_watch_mask, 0x8000u),
+    DEFINE_PROP_UINT32("bb-tx-watch-value", Esp32BtState,
+                       bb_tx_watch_value, 0x8000u),
+    DEFINE_PROP_UINT32("bb-tx-owner-bit", Esp32BtState,
+                       bb_tx_owner_bit, 15),
+    DEFINE_PROP_UINT32("bb-tx-status-bit", Esp32BtState,
+                       bb_tx_status_bit, 14),
+    DEFINE_PROP_BOOL("bb-tx-rwble", Esp32BtState, bb_tx_rwble, false),
+    DEFINE_PROP_UINT64("bb-tx-poll-ns", Esp32BtState,
+                       bb_tx_poll_ns, 200000),
+    DEFINE_PROP_UINT64("bb-tx-delay-ns", Esp32BtState,
+                       bb_tx_delay_ns, 1000000),
     DEFINE_PROP_END_OF_LIST(),
 };
 
