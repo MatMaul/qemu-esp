@@ -329,8 +329,13 @@ typedef struct Esp32BtState {
     uint32_t bb_ble_evt_tx_idx_off;
     uint32_t bb_ble_evt_tx_len_off;
     uint32_t bb_ble_evt_tx_llid_off;
+    uint32_t bb_ble_evt_tx_buf_off;
     uint32_t bb_ble_evt_desc_base;
     uint32_t bb_ble_evt_txbuf_off;
+    uint32_t bb_ble_evt_pend_off;
+    uint32_t bb_ble_evt_ack_bit;
+    uint32_t bb_ble_evt_attach_bit;
+    bool bb_ble_evt_tx_ack;
     uint32_t bb_ble_evt_list_addr;
     bool bb_ble_evt_list_set;
     uint32_t bb_ble_evt_ea_env_addr;

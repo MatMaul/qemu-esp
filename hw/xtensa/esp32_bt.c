@@ -1173,6 +1173,7 @@ static void esp32_bt_ble_evt_start(void *opaque)
 {
     Esp32BtState *s = ESP32_BT(opaque);
     uint32_t link = 0, tx = 0, idx, len, llid, desc, hdr;
+    uint32_t bufidx = 0, pend = 0;
     uint32_t lid = s->bb_ble_evt_handle & 0xffffu;
 
     if (!s->bb_ble_evt_inject || s->bb_ble_evt_fired) {
@@ -1189,18 +1190,35 @@ static void esp32_bt_ble_evt_start(void *opaque)
         idx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_idx_off, 1);
         len = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_len_off, 2);
         llid = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_llid_off, 1);
+        bufidx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_buf_off, 1);
         desc = s->bb_ble_evt_desc_base + 8u * idx;
         hdr = ((len & 0xffu) << 8) | (llid & 0xffu);
 
         /*
          * Program the per-activity LL-PDU descriptor from the queued
          * element.  The header word is the on-air LL header the descriptor
-         * carries: length in bits 15:8, LLID in 7:0.
+         * carries: length in bits 15:8, LLID in 7:0.  The low byte of +6 is
+         * the attached TX-buffer index and the attach bit marks the buffer
+         * as owned by the radio; r_em_buf_tx_free only returns the buffer to
+         * the pool when that bit is set (spec/04 §3.11).
          */
         esp32_bt_em_write16(s, desc + 0x00, (uint16_t)lid);
         esp32_bt_em_write16(s, desc + 0x02, (uint16_t)hdr);
         esp32_bt_em_write16(s, desc + 0x04, (uint16_t)s->bb_ble_evt_txbuf_off);
-        esp32_bt_em_write16(s, desc + 0x06, 0);
+        esp32_bt_em_write16(s, desc + 0x06,
+                            (uint16_t)((bufidx & 0xffu) |
+                                       (1u << (s->bb_ble_evt_attach_bit & 15u))));
+
+        /*
+         * r_lld_pdu_data_tx_push increments the link's pending-packet byte
+         * when it attaches a TX buffer.  Mirror that so the LLD state matches
+         * the controller's own bookkeeping.
+         */
+        if (s->bb_ble_evt_pend_off != 0) {
+            pend = esp32_bt_guest_read(s, link + s->bb_ble_evt_pend_off, 1);
+            pend = (pend + 1u) & 0xffu;
+            esp32_bt_guest_write(s, link + s->bb_ble_evt_pend_off, pend, 1);
+        }
     } else {
         idx = 0;
         hdr = 0;
@@ -1234,9 +1252,9 @@ static void esp32_bt_ble_evt_start(void *opaque)
     s->bb_ble_evt_events++;
     ESP32_BT_LOG(s,
                   "esp32_bt: BLE event start link=%08x lid=%04x desc=%02x "
-                  "hdr=%04x off=%04x state=%02x ea=%08x list=%08x "
-                  "events=%u clock=%u\n",
-                  link, lid, idx, hdr, s->bb_ble_evt_txbuf_off,
+                  "hdr=%04x off=%04x buf=%02x pend=%02x state=%02x ea=%08x "
+                  "list=%08x events=%u clock=%u\n",
+                  link, lid, idx, hdr, s->bb_ble_evt_txbuf_off, bufidx, pend,
                   esp32_bt_guest_read(s,
                                       link + s->bb_ble_evt_state_off, 1),
                   s->bb_ble_evt_ea_env_addr != 0 ?
@@ -1254,6 +1272,7 @@ static void esp32_bt_ble_evt_end(void *opaque)
 {
     Esp32BtState *s = ESP32_BT(opaque);
     uint32_t link = 0, tx = 0, idx = 0, hdr, len, llid, off;
+    uint32_t desc, ack = 0;
     uint8_t payload[64];
     uint32_t i, n;
     char hex[3 * sizeof(payload) + 1];
@@ -1272,8 +1291,9 @@ static void esp32_bt_ble_evt_end(void *opaque)
         ESP32_BT_LOG(s, "esp32_bt: BLE event end without a queued element\n");
     } else {
         idx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_idx_off, 1);
-        hdr = esp32_bt_em_read16(s, s->bb_ble_evt_desc_base + 8u * idx + 0x02);
-        off = esp32_bt_em_read16(s, s->bb_ble_evt_desc_base + 8u * idx + 0x04);
+        desc = s->bb_ble_evt_desc_base + 8u * idx;
+        hdr = esp32_bt_em_read16(s, desc + 0x02);
+        off = esp32_bt_em_read16(s, desc + 0x04);
         len = (hdr >> 8) & 0xffu;
         llid = hdr & 0xffu;
         n = MIN(len, sizeof(payload));
@@ -1285,10 +1305,24 @@ static void esp32_bt_ble_evt_end(void *opaque)
         }
         hex[pos] = 0;
 
+        /*
+         * Baseband TX acknowledgement.  When the radio has transmitted the
+         * PDU it sets the TX-done bit in the descriptor link word; the LLD's
+         * r_lld_pdu_check consumes elements whose +0 has this bit set.
+         */
+        if (s->bb_ble_evt_tx_ack) {
+            uint32_t bit = 1u << (s->bb_ble_evt_ack_bit & 15u);
+
+            ack = esp32_bt_em_read16(s, desc + 0x00);
+            ack = (ack & ~bit) | bit;
+            esp32_bt_em_write16(s, desc + 0x00, (uint16_t)ack);
+        }
+
         ESP32_BT_LOG(s,
                       "esp32_bt: BLE event end link=%08x desc=%02x hdr=%04x "
-                      "off=%04x len=%u llid=%u payload=%s clock=%u\n",
-                      link, idx, hdr, off, len, llid, hex, esp32_bt_bt_clk(s));
+                      "off=%04x len=%u llid=%u payload=%s ack=%04x clock=%u\n",
+                      link, idx, hdr, off, len, llid, hex, ack,
+                      esp32_bt_bt_clk(s));
     }
 
     if (s->bb_ble_evt_raise_end) {
@@ -2561,10 +2595,20 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_tx_len_off, 8),
     DEFINE_PROP_UINT32("bb-ble-evt-tx-llid-off", Esp32BtState,
                        bb_ble_evt_tx_llid_off, 10),
+    DEFINE_PROP_UINT32("bb-ble-evt-tx-buf-off", Esp32BtState,
+                       bb_ble_evt_tx_buf_off, 6),
     DEFINE_PROP_UINT32("bb-ble-evt-desc-base", Esp32BtState,
                        bb_ble_evt_desc_base, 0x05c0),
     DEFINE_PROP_UINT32("bb-ble-evt-txbuf-off", Esp32BtState,
                        bb_ble_evt_txbuf_off, 0x0b96),
+    DEFINE_PROP_UINT32("bb-ble-evt-pend-off", Esp32BtState,
+                       bb_ble_evt_pend_off, 0x8c),
+    DEFINE_PROP_UINT32("bb-ble-evt-ack-bit", Esp32BtState,
+                       bb_ble_evt_ack_bit, 15),
+    DEFINE_PROP_UINT32("bb-ble-evt-attach-bit", Esp32BtState,
+                       bb_ble_evt_attach_bit, 15),
+    DEFINE_PROP_BOOL("bb-ble-evt-tx-ack", Esp32BtState,
+                     bb_ble_evt_tx_ack, true),
     DEFINE_PROP_UINT32("bb-ble-evt-list-addr", Esp32BtState,
                        bb_ble_evt_list_addr, 0),
     DEFINE_PROP_BOOL("bb-ble-evt-list-set", Esp32BtState,
