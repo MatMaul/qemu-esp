@@ -280,6 +280,9 @@ enum {
     ESP32_BT_TMR_RWBLE_PROBE,
     ESP32_BT_TMR_TX_WATCH,
     ESP32_BT_TMR_TX_COMPLETE,
+    ESP32_BT_TMR_BLE_EVT_WATCH,
+    ESP32_BT_TMR_BLE_EVT_START,
+    ESP32_BT_TMR_BLE_EVT_END,
     ESP32_BT_TMR_COUNT,
 };
 
@@ -1071,6 +1074,219 @@ static void esp32_bt_tx_watch_arm_start(Esp32BtState *s)
 }
 
 /*
+ * Opt-in BLE connection-event model.
+ *
+ * The LLD queues an LE ACL PDU on the link object reached through
+ * `llc_env[handle] + link_off`, but without a baseband the link id at
+ * `link + lid_off` stays `0xffff` and no per-activity LL-PDU descriptor is
+ * programmed.  The previous BLE slice assigned both from the gdb harness.
+ * This model derives them from guest state instead:
+ *
+ *   1. poll the link's TX list (`link + txlist_off`) until it is non-empty;
+ *   2. at the event-start tick, read the queued element's descriptor index,
+ *      length and LLID, assign the link id and program the descriptor at
+ *      `desc_base + 8*index` with payload offset `txbuf_off`;
+ *   3. at the event-end tick, read the descriptor and payload back (the
+ *      baseband read) and optionally raise the RWBLE event-end status bit.
+ *
+ * The descriptor layout and field positions are the ones claimed for the
+ * BLE EM region (spec/04 §3.10); the timing and every address are model
+ * properties.  Nothing here is silicon or on-air evidence.
+ */
+static uint32_t esp32_bt_guest_read(Esp32BtState *s, uint32_t addr, size_t size)
+{
+    uint32_t v = 0;
+
+    if (size == 0 || size > 4) {
+        return 0;
+    }
+    address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                       &v, size);
+    return v;
+}
+
+static void esp32_bt_guest_write(Esp32BtState *s, uint32_t addr,
+                                 uint32_t v, size_t size)
+{
+    if (size == 0 || size > 4) {
+        return;
+    }
+    address_space_write(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                        &v, size);
+}
+
+/* Resolve llc_env[handle] -> link object -> queued TX element. */
+static bool esp32_bt_ble_evt_state(Esp32BtState *s, uint32_t *link_out,
+                                   uint32_t *tx_out)
+{
+    uint32_t env, link, tx;
+
+    if (s->bb_ble_evt_llc_env_addr == 0) {
+        return false;
+    }
+    env = esp32_bt_guest_read(s,
+                              s->bb_ble_evt_llc_env_addr +
+                              4u * s->bb_ble_evt_handle, 4);
+    if (env == 0) {
+        return false;
+    }
+    link = esp32_bt_guest_read(s, env + s->bb_ble_evt_link_off, 4);
+    if (link == 0) {
+        return false;
+    }
+    tx = esp32_bt_guest_read(s, link + s->bb_ble_evt_txlist_off, 4);
+    *link_out = link;
+    *tx_out = tx;
+    return true;
+}
+
+static void esp32_bt_ble_evt_poll(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t link = 0, tx = 0;
+
+    if (!s->bb_ble_evt_inject || s->bb_ble_evt_fired) {
+        s->bb_ble_evt_armed = false;
+        return;
+    }
+    if (esp32_bt_ble_evt_state(s, &link, &tx) && tx != 0) {
+        ESP32_BT_LOG(s,
+                      "esp32_bt: BLE event watch fired link=%08x tx=%08x "
+                      "handle=%u delay=%" PRIu64 "ns clock=%u\n",
+                      link, tx, s->bb_ble_evt_handle,
+                      s->bb_ble_evt_start_delay_ns, esp32_bt_bt_clk(s));
+        esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_START,
+                       s->bb_ble_evt_start_timer,
+                       s->bb_ble_evt_start_delay_ns);
+        return;
+    }
+    esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_WATCH, s->bb_ble_evt_poll_timer,
+                   s->bb_ble_evt_poll_ns);
+}
+
+static void esp32_bt_ble_evt_start(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t link = 0, tx = 0, idx, len, llid, desc, hdr;
+    uint32_t lid = s->bb_ble_evt_handle & 0xffffu;
+
+    if (!s->bb_ble_evt_inject || s->bb_ble_evt_fired) {
+        return;
+    }
+    if (!esp32_bt_ble_evt_state(s, &link, &tx) || tx == 0) {
+        /* The PDU was flushed before the event; go back to watching. */
+        esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_WATCH,
+                       s->bb_ble_evt_poll_timer, s->bb_ble_evt_poll_ns);
+        return;
+    }
+
+    idx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_idx_off, 1);
+    len = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_len_off, 2);
+    llid = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_llid_off, 1);
+    desc = s->bb_ble_evt_desc_base + 8u * idx;
+    hdr = ((len & 0xffu) << 8) | (llid & 0xffu);
+
+    /*
+     * Assign the connection's link id and program the per-activity LL-PDU
+     * descriptor from the queued element.  The header word is the on-air
+     * LL header the descriptor carries: length in bits 15:8, LLID in 7:0.
+     */
+    esp32_bt_guest_write(s, link + s->bb_ble_evt_lid_off, lid, 2);
+    esp32_bt_em_write16(s, desc + 0x00, (uint16_t)lid);
+    esp32_bt_em_write16(s, desc + 0x02, (uint16_t)hdr);
+    esp32_bt_em_write16(s, desc + 0x04, (uint16_t)s->bb_ble_evt_txbuf_off);
+    esp32_bt_em_write16(s, desc + 0x06, 0);
+
+    /*
+     * A real event start moves the wait-list element to the current-event
+     * co_list at lld_evt_env, which r_lld_evt_end_isr pops.  With no baseband
+     * that list stays empty; the end tick (opt-in) supplies it instead.
+     */
+    s->bb_ble_evt_events++;
+    ESP32_BT_LOG(s,
+                  "esp32_bt: BLE event start link=%08x lid=%04x desc=%02x "
+                  "hdr=%04x off=%04x events=%u clock=%u\n",
+                  link, lid, idx, hdr, s->bb_ble_evt_txbuf_off,
+                  s->bb_ble_evt_events, esp32_bt_bt_clk(s));
+    esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_END, s->bb_ble_evt_end_timer,
+                   s->bb_ble_evt_duration_ns);
+}
+
+static void esp32_bt_ble_evt_end(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t link = 0, tx = 0, idx = 0, hdr, len, llid, off;
+    uint8_t payload[64];
+    uint32_t i, n;
+    char hex[3 * sizeof(payload) + 1];
+    int pos = 0;
+
+    if (!s->bb_ble_evt_inject || s->bb_ble_evt_fired) {
+        return;
+    }
+    s->bb_ble_evt_fired = true;
+
+    if (!esp32_bt_ble_evt_state(s, &link, &tx) || tx == 0) {
+        ESP32_BT_LOG(s, "esp32_bt: BLE event end without a queued element\n");
+        return;
+    }
+
+    idx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_idx_off, 1);
+    hdr = esp32_bt_em_read16(s, s->bb_ble_evt_desc_base + 8u * idx + 0x02);
+    off = esp32_bt_em_read16(s, s->bb_ble_evt_desc_base + 8u * idx + 0x04);
+    len = (hdr >> 8) & 0xffu;
+    llid = hdr & 0xffu;
+    n = MIN(len, sizeof(payload));
+    memset(payload, 0, sizeof(payload));
+    for (i = 0; i < n; i++) {
+        payload[i] = (uint8_t)esp32_bt_guest_read(s,
+                          esp32_bt_em_base(s) + off + i, 1);
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", payload[i]);
+    }
+    hex[pos] = 0;
+
+    ESP32_BT_LOG(s,
+                  "esp32_bt: BLE event end link=%08x desc=%02x hdr=%04x "
+                  "off=%04x len=%u llid=%u payload=%s clock=%u\n",
+                  link, idx, hdr, off, len, llid, hex, esp32_bt_bt_clk(s));
+
+    if (s->bb_ble_evt_raise_end) {
+        if (s->bb_ble_evt_list_set && s->bb_ble_evt_list_addr != 0) {
+            esp32_bt_guest_write(s, s->bb_ble_evt_list_addr, link, 4);
+            ESP32_BT_LOG(s,
+                          "esp32_bt: BLE event list addr=%08x <- %08x "
+                          "readback=%08x link_next=%08x\n",
+                          s->bb_ble_evt_list_addr, link,
+                          esp32_bt_guest_read(s, s->bb_ble_evt_list_addr, 4),
+                          esp32_bt_guest_read(s, link, 4));
+        }
+        if (s->bb_ble_evt_ea_env_addr != 0) {
+            esp32_bt_guest_write(s, s->bb_ble_evt_ea_env_addr, link, 4);
+        }
+        s->rwble_irq_status |= 1u << (s->bb_ble_evt_end_status_bit & 31u);
+        ESP32_BT_LOG(s,
+                      "esp32_bt: BLE event end status bit %u -> %08x\n",
+                      s->bb_ble_evt_end_status_bit, s->rwble_irq_status);
+        esp32_bt_update_irqs(s);
+    }
+}
+
+static void esp32_bt_ble_evt_arm_start(Esp32BtState *s)
+{
+    if (!s->bb_ble_evt_inject || s->bb_ble_evt_llc_env_addr == 0 ||
+        s->bb_ble_evt_armed || s->bb_ble_evt_fired) {
+        return;
+    }
+    s->bb_ble_evt_armed = true;
+    ESP32_BT_LOG(s,
+                  "esp32_bt: BLE event watch armed llc_env=%08x handle=%u "
+                  "poll=%" PRIu64 "ns clock=%u\n",
+                  s->bb_ble_evt_llc_env_addr, s->bb_ble_evt_handle,
+                  s->bb_ble_evt_poll_ns, esp32_bt_bt_clk(s));
+    esp32_bt_ble_evt_poll(s);
+}
+
+/*
  * Sleep/wakeup synthesis.
  *
  * Sequence:
@@ -1209,6 +1425,15 @@ static void esp32_bt_fire_one(Esp32BtState *s, int id)
         break;
     case ESP32_BT_TMR_TX_COMPLETE:
         esp32_bt_tx_complete(s);
+        break;
+    case ESP32_BT_TMR_BLE_EVT_WATCH:
+        esp32_bt_ble_evt_poll(s);
+        break;
+    case ESP32_BT_TMR_BLE_EVT_START:
+        esp32_bt_ble_evt_start(s);
+        break;
+    case ESP32_BT_TMR_BLE_EVT_END:
+        esp32_bt_ble_evt_end(s);
         break;
     }
 }
@@ -1578,6 +1803,7 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
     esp32_bt_rwble_probe_arm_start(s);
     esp32_bt_rx_watch_arm_start(s);
     esp32_bt_tx_watch_arm_start(s);
+    esp32_bt_ble_evt_arm_start(s);
 
     switch (off) {
     case RWBT_CTRL:
@@ -1681,6 +1907,7 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     esp32_bt_rwble_probe_arm_start(s);
     esp32_bt_rx_watch_arm_start(s);
     esp32_bt_tx_watch_arm_start(s);
+    esp32_bt_ble_evt_arm_start(s);
 
     switch (off) {
     case RWBT_CTRL:
@@ -1785,6 +2012,9 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
             timer_del(s->bb_rx_watch_timer);
             timer_del(s->bb_tx_watch_timer);
             timer_del(s->bb_tx_timer);
+            timer_del(s->bb_ble_evt_poll_timer);
+            timer_del(s->bb_ble_evt_start_timer);
+            timer_del(s->bb_ble_evt_end_timer);
             for (int i = 0; i < ESP32_BT_TMR_COUNT; i++) {
                 s->model_active[i] = false;
             }
@@ -1792,6 +2022,10 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
             s->bb_tx_armed = false;
             if (s->bb_tx_inject && !s->bb_tx_fired) {
                 esp32_bt_tx_watch_arm_start(s);
+            }
+            s->bb_ble_evt_armed = false;
+            if (s->bb_ble_evt_inject && !s->bb_ble_evt_fired) {
+                esp32_bt_ble_evt_arm_start(s);
             }
             if (s->bb_sw_inject && s->bb_sw_armed) {
                 esp32_bt_sched(s, ESP32_BT_TMR_SW_TICK, s->bb_sw_timer,
@@ -1897,6 +2131,7 @@ static uint64_t esp32_bt_bb_read(void *opaque, hwaddr addr, unsigned int size)
 
     esp32_bt_model_advance(s);
     esp32_bt_tx_watch_arm_start(s);
+    esp32_bt_ble_evt_arm_start(s);
 
     ESP32_BT_TEXT_LOG(s, "esp32_bt: BB    read  %04x -> %08x\n",
                       (uint32_t)off, r);
@@ -1914,6 +2149,7 @@ static void esp32_bt_bb_write(void *opaque, hwaddr addr,
 
     esp32_bt_model_advance(s);
     esp32_bt_tx_watch_arm_start(s);
+    esp32_bt_ble_evt_arm_start(s);
     s->bb[off / 4] = v;
     ESP32_BT_TEXT_LOG(s, "esp32_bt: BB    write %04x <- %08x\n",
                       (uint32_t)off, v);
@@ -1985,6 +2221,12 @@ static void esp32_bt_reset(DeviceState *dev)
     s->bb_tx_armed = false;
     s->bb_tx_fired = false;
     s->bb_tx_completions = 0;
+    esp32_bt_cancel(s, ESP32_BT_TMR_BLE_EVT_WATCH, s->bb_ble_evt_poll_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_BLE_EVT_START, s->bb_ble_evt_start_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_BLE_EVT_END, s->bb_ble_evt_end_timer);
+    s->bb_ble_evt_armed = false;
+    s->bb_ble_evt_fired = false;
+    s->bb_ble_evt_events = 0;
     s->model_ns = 0;
     s->model_base_ns = 0;
     s->model_base_count = 0;
@@ -2057,6 +2299,12 @@ static void esp32_bt_init(Object *obj)
                                         esp32_bt_tx_watch_poll, s);
     s->bb_tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                   esp32_bt_tx_complete, s);
+    s->bb_ble_evt_poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                            esp32_bt_ble_evt_poll, s);
+    s->bb_ble_evt_start_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                             esp32_bt_ble_evt_start, s);
+    s->bb_ble_evt_end_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                           esp32_bt_ble_evt_end, s);
     s->model_idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        esp32_bt_model_idle, s);
 }
@@ -2238,6 +2486,51 @@ static Property esp32_bt_properties[] = {
                        bb_tx_poll_ns, 200000),
     DEFINE_PROP_UINT64("bb-tx-delay-ns", Esp32BtState,
                        bb_tx_delay_ns, 1000000),
+
+    /*
+     * Opt-in BLE connection-event model.  Disabled by default.  It watches the
+     * LLD link reached through llc_env[handle] + link-off and its TX list, then
+     * derives the link id and per-activity LL-PDU descriptor from the queued
+     * element and performs the baseband descriptor read (spec/04 §3.10).
+     */
+    DEFINE_PROP_BOOL("bb-ble-evt-inject", Esp32BtState,
+                     bb_ble_evt_inject, false),
+    DEFINE_PROP_UINT32("bb-ble-evt-llc-env-addr", Esp32BtState,
+                       bb_ble_evt_llc_env_addr, 0),
+    DEFINE_PROP_UINT32("bb-ble-evt-handle", Esp32BtState,
+                       bb_ble_evt_handle, 0),
+    DEFINE_PROP_UINT32("bb-ble-evt-link-off", Esp32BtState,
+                       bb_ble_evt_link_off, 16),
+    DEFINE_PROP_UINT32("bb-ble-evt-txlist-off", Esp32BtState,
+                       bb_ble_evt_txlist_off, 48),
+    DEFINE_PROP_UINT32("bb-ble-evt-lid-off", Esp32BtState,
+                       bb_ble_evt_lid_off, 104),
+    DEFINE_PROP_UINT32("bb-ble-evt-tx-idx-off", Esp32BtState,
+                       bb_ble_evt_tx_idx_off, 4),
+    DEFINE_PROP_UINT32("bb-ble-evt-tx-len-off", Esp32BtState,
+                       bb_ble_evt_tx_len_off, 8),
+    DEFINE_PROP_UINT32("bb-ble-evt-tx-llid-off", Esp32BtState,
+                       bb_ble_evt_tx_llid_off, 10),
+    DEFINE_PROP_UINT32("bb-ble-evt-desc-base", Esp32BtState,
+                       bb_ble_evt_desc_base, 0x05c0),
+    DEFINE_PROP_UINT32("bb-ble-evt-txbuf-off", Esp32BtState,
+                       bb_ble_evt_txbuf_off, 0x0b96),
+    DEFINE_PROP_UINT32("bb-ble-evt-list-addr", Esp32BtState,
+                       bb_ble_evt_list_addr, 0),
+    DEFINE_PROP_BOOL("bb-ble-evt-list-set", Esp32BtState,
+                     bb_ble_evt_list_set, false),
+    DEFINE_PROP_UINT32("bb-ble-evt-ea-env-addr", Esp32BtState,
+                       bb_ble_evt_ea_env_addr, 0),
+    DEFINE_PROP_UINT32("bb-ble-evt-end-status-bit", Esp32BtState,
+                       bb_ble_evt_end_status_bit, 3),
+    DEFINE_PROP_BOOL("bb-ble-evt-raise-end", Esp32BtState,
+                     bb_ble_evt_raise_end, false),
+    DEFINE_PROP_UINT64("bb-ble-evt-poll-ns", Esp32BtState,
+                       bb_ble_evt_poll_ns, 200000),
+    DEFINE_PROP_UINT64("bb-ble-evt-start-delay-ns", Esp32BtState,
+                       bb_ble_evt_start_delay_ns, 1000000),
+    DEFINE_PROP_UINT64("bb-ble-evt-duration-ns", Esp32BtState,
+                       bb_ble_evt_duration_ns, 2000000),
     DEFINE_PROP_END_OF_LIST(),
 };
 

@@ -302,4 +302,45 @@ typedef struct Esp32BtState {
     uint32_t bb_tx_completions;
     QEMUTimer *bb_tx_watch_timer;
     QEMUTimer *bb_tx_timer;
+
+    /*
+     * Opt-in BLE connection-event model.  Disabled by default.
+     *
+     * The stock LLD queues an LE ACL PDU on the link object reached through
+     * `llc_env[handle] + link-off`, but with no baseband it never assigns the
+     * link id (`link + lid-off`, `0xffff` before an event), programs the
+     * per-activity LL-PDU descriptor, or reads that descriptor on air.  This
+     * model polls the link's TX list, and on a non-empty list derives the
+     * link id and descriptor from guest state at a modelled event-start tick,
+     * then performs the baseband descriptor read at the event-end tick.  It
+     * can also raise the RWBLE event-end status bit so the guest's own
+     * r_lld_evt_end_isr runs.  Every offset, the descriptor base and the EM
+     * payload offset is a property; the timing is model-defined and is not a
+     * silicon or RF claim.
+     */
+    bool bb_ble_evt_inject;
+    uint32_t bb_ble_evt_llc_env_addr;
+    uint32_t bb_ble_evt_handle;
+    uint32_t bb_ble_evt_link_off;
+    uint32_t bb_ble_evt_txlist_off;
+    uint32_t bb_ble_evt_lid_off;
+    uint32_t bb_ble_evt_tx_idx_off;
+    uint32_t bb_ble_evt_tx_len_off;
+    uint32_t bb_ble_evt_tx_llid_off;
+    uint32_t bb_ble_evt_desc_base;
+    uint32_t bb_ble_evt_txbuf_off;
+    uint32_t bb_ble_evt_list_addr;
+    bool bb_ble_evt_list_set;
+    uint32_t bb_ble_evt_ea_env_addr;
+    uint32_t bb_ble_evt_end_status_bit;
+    bool bb_ble_evt_raise_end;
+    uint64_t bb_ble_evt_poll_ns;
+    uint64_t bb_ble_evt_start_delay_ns;
+    uint64_t bb_ble_evt_duration_ns;
+    bool bb_ble_evt_armed;
+    bool bb_ble_evt_fired;
+    uint32_t bb_ble_evt_events;
+    QEMUTimer *bb_ble_evt_poll_timer;
+    QEMUTimer *bb_ble_evt_start_timer;
+    QEMUTimer *bb_ble_evt_end_timer;
 } Esp32BtState;
