@@ -312,11 +312,13 @@ typedef struct Esp32BtState {
      * per-activity LL-PDU descriptor, or reads that descriptor on air.  This
      * model polls the link's TX list, and on a non-empty list derives the
      * link id and descriptor from guest state at a modelled event-start tick,
-     * then performs the baseband descriptor read at the event-end tick.  It
-     * can also raise the RWBLE event-end status bit so the guest's own
-     * r_lld_evt_end_isr runs.  Every offset, the descriptor base and the EM
-     * payload offset is a property; the timing is model-defined and is not a
-     * silicon or RF claim.
+     * link id and descriptor from guest state at a modelled event-start tick,
+     * sets the LLD event state, publishes the link as the EA current element
+     * and pushes it onto the current-event list, then performs the baseband
+     * descriptor read at the event-end tick.  It can also raise the RWBLE
+     * event-end status bit so the guest's own r_lld_evt_end_isr runs.  Every
+     * offset, the descriptor base and the EM payload offset is a property; the
+     * timing is model-defined and is not a silicon or RF claim.
      */
     bool bb_ble_evt_inject;
     uint32_t bb_ble_evt_llc_env_addr;
@@ -332,6 +334,10 @@ typedef struct Esp32BtState {
     uint32_t bb_ble_evt_list_addr;
     bool bb_ble_evt_list_set;
     uint32_t bb_ble_evt_ea_env_addr;
+    uint32_t bb_ble_evt_ea_curr_off;
+    uint32_t bb_ble_evt_state_off;
+    uint32_t bb_ble_evt_state_value;
+    bool bb_ble_evt_start_push;
     uint32_t bb_ble_evt_end_status_bit;
     bool bb_ble_evt_raise_end;
     uint64_t bb_ble_evt_poll_ns;
