@@ -354,6 +354,12 @@ static void esp32_bt_guest_write(Esp32BtState *s, uint32_t addr, uint32_t v,
                                  size_t size);
 static bool esp32_bt_ble_evt_state(Esp32BtState *s, uint32_t *link_out,
                                    uint32_t *tx_out);
+static bool esp32_bt_ble_evt_program(Esp32BtState *s, uint32_t link,
+                                     uint32_t tx, uint32_t *idx_out,
+                                     uint32_t *hdr_out, uint32_t *bufidx_out,
+                                     uint32_t *pend_out);
+static void esp32_bt_ble_evt_move_inflight(Esp32BtState *s, uint32_t link,
+                                           uint32_t tx);
 static Esp32BtState *esp32_bt_plugin_state;
 
 static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
@@ -364,13 +370,13 @@ static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
 
     /*
      * r_ea_finetimer_isr only runs the EA element whose programmed target
-     * equals the half-slot clock it reads (a3 == a5 at 0x4001571c).  Real
-     * hardware raises the fine-timer interrupt inside the target slot, so the
-     * read-back clock is still the target.  A host-time clock keeps advancing
-     * between the model's fire and the guest's read, which would make the
-     * comparison miss by one and drop the event.  Hold the clock at the fired
-     * target for a short latency window (well under one 625 us slot) so
-     * r_ea_finetimer_isr sees the slot it was woken for.  This is a model
+     * equals the half-slot clock it reads (a3 == a5 at 0x4001571c).  The ISR
+     * reads that clock once at entry, and on silicon the interrupt is taken
+     * inside the target slot, so the read-back clock is still the target.  A
+     * host-time clock keeps advancing between the model's fire and the guest's
+     * read, which would make the comparison miss by one or more slots and drop
+     * the event.  Hold the clock at the fired target for the read at ISR
+     * entry, keeping the floor monotonic afterwards.  This is a model
      * consistency aid, not a timing claim.
      */
     if (now_ns < s->clock_hold_until) {
@@ -798,13 +804,25 @@ static void esp32_bt_ea_fire(void *opaque)
     s->ea_status_pending = true;
     s->ea_target_valid = false;  /* consumed by this expiry */
     s->ea_fires++;
+    s->ea_diag_pending = true;
     {
         uint64_t target_ticks = (uint64_t)s->ea_target * 2u;
 
         if (target_ticks > s->clock_floor) {
             s->clock_floor = target_ticks;
         }
-        s->clock_hold_until = esp32_bt_now_ns(s) + 200000;
+        /*
+         * The ROM's r_ea_time_get_halfslot_rounded() samples the native
+         * clock once at ISR entry; on silicon the fine-timer interrupt is
+         * taken inside the target slot.  r_ea_finetimer_isr then requires the
+         * sampled half-slot to equal the element start exactly.  Under TCG the
+         * guest can service the interrupt a millisecond or more after the
+         * model raises it, so a sub-slot hold lets the clock move past the
+         * target and the due check fails.  Pin the guest-visible clock to the
+         * fired target until the ISR has run (bounded, so a lost interrupt
+         * cannot freeze the clock).
+         */
+        s->clock_hold_until = esp32_bt_now_ns(s) + 5000000;
     }
     if (s->bb_ea_rwble) {
         s->rwble_irq_status |= 1u << (s->bb_ea_ble_status_bit & 31u);
@@ -862,6 +880,64 @@ static void esp32_bt_ea_fire(void *opaque)
             elt = next;
         }
     }
+
+    /*
+     * Baseband activity-start condition.  The controller's event arbiter only
+     * runs an element's start callback; it does not mark the activity active.
+     * In silicon the baseband starts the activity at the programmed target
+     * and transitions it to its running state before the callback sees it.  For a connection that is the per-activity LL-PDU descriptor, the
+     * link id and the active event state, so model them here, before the
+     * fine-timer interrupt lets r_ea_finetimer_isr pop the element and call
+     * r_lld_evt_schedule with the link already active.
+     */
+    if (s->bb_ble_evt_ctrl_start && s->bb_ble_evt_inject &&
+        !s->bb_ble_evt_fired && !s->bb_ble_evt_started &&
+        s->bb_ble_evt_ea_env_addr != 0) {
+        uint32_t link = 0, tx = 0;
+
+        if (esp32_bt_ble_evt_state(s, &link, &tx) && tx != 0 &&
+            esp32_bt_guest_read(s, s->bb_ble_evt_ea_env_addr, 4) == link) {
+            uint32_t target = esp32_bt_guest_read(s, link + 8, 4);
+            uint32_t dur = esp32_bt_guest_read(s, link + 0x19, 1);
+            uint32_t start = (target - dur) & ESP32_BT_EA_WRAP_MASK;
+
+            if (start == (s->ea_target & ESP32_BT_EA_WRAP_MASK)) {
+                uint32_t idx, hdr, bufidx, pend;
+
+                s->bb_ble_evt_started = true;
+                esp32_bt_ble_evt_program(s, link, tx, &idx, &hdr, &bufidx,
+                                         &pend);
+                esp32_bt_ble_evt_move_inflight(s, link, tx);
+                s->bb_ble_evt_tx = tx;
+                esp32_bt_guest_write(s, link + s->bb_ble_evt_lid_off,
+                                     s->bb_ble_evt_handle & 0xffffu, 2);
+                /*
+                 * The LLD event-start path derives the RX window size from
+                 * link+0x78 minus the event target.  In silicon the baseband
+                 * fills that field when it activates the activity; without it
+                 * r_lld_evt_schedule asserts on the window size.
+                 */
+                if (s->bb_ble_evt_rxwinsz != 0) {
+                    esp32_bt_guest_write(
+                        s, link + 0x78,
+                        (target + s->bb_ble_evt_rxwinsz) & 0xffffu, 2);
+                }
+                esp32_bt_guest_write(s, link + s->bb_ble_evt_state_off,
+                                     s->bb_ble_evt_state_value, 1);
+                ESP32_BT_LOG(s,
+                              "esp32_bt: BLE baseband event start "
+                              "link=%08x lid=%04x desc=%02x hdr=%04x "
+                              "off=%04x buf=%02x pend=%02x target=%08x "
+                              "start=%08x state=%02x clock=%u\n",
+                              link, s->bb_ble_evt_handle & 0xffffu, idx, hdr,
+                              s->bb_ble_evt_txbuf_off, bufidx, pend, target,
+                              start,
+                              esp32_bt_guest_read(
+                                  s, link + s->bb_ble_evt_state_off, 1),
+                              esp32_bt_bt_clk(s));
+            }
+        }
+    }
     esp32_bt_update_irqs(s);
 }
 
@@ -884,6 +960,7 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
      */
     if (s->bb_ble_evt_ctrl_start) {
         bool ready = true;
+        bool gate_active = false;
         uint32_t gate_link = 0;
         uint32_t gate_target = 0;
 
@@ -895,22 +972,24 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
              * r_lld_con_start publishes the initiator request element at
              * llm_elt+4 and r_llm_con_req_tx_cfm consumes it, which clears
              * the word before the established link stores its own element.
-             * The gate samples on every fine-timer register access, which is
-             * frequent enough inside the confirmation to see that transient.
-             * Only after it is observed may the arbiter run: an initiator
-             * event would otherwise end before the harness-injected peer
-             * confirmation arrives.
+             * Only hold the arbiter once that transaction has started: an
+             * initiator event would otherwise end before the harness-injected
+             * peer confirmation arrives, while holding the timer from boot
+             * stalls the inquiry/scan scheduling and can wedge the controller.
              */
             if (cur != 0) {
                 s->bb_ble_evt_init_elt = cur;
             } else if (s->bb_ble_evt_init_elt != 0) {
                 s->bb_ble_con_pending = true;
             }
-            if (!s->bb_ble_con_pending) {
-                ready = false;
+            if (s->bb_ble_evt_init_elt != 0) {
+                gate_active = true;
+                if (!s->bb_ble_con_pending) {
+                    ready = false;
+                }
             }
         }
-        if (ready) {
+        if (gate_active && ready) {
             uint32_t link = 0, tx = 0;
 
             if (esp32_bt_ble_evt_state(s, &link, &tx)) {
@@ -918,7 +997,7 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
                 gate_target = esp32_bt_guest_read(s, link + 8, 4);
             }
         }
-        if (!ready) {
+        if (gate_active && !ready) {
             esp32_bt_cancel(s, ESP32_BT_TMR_EA_FINE, s->bb_fine_timer);
             s->ea_armed = false;
             ESP32_BT_LOG(s,
@@ -931,17 +1010,32 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
                           s->ea_target, esp32_bt_bt_clk(s));
             return;
         }
-        if (s->bb_ble_evt_ea_env_addr != 0 && gate_link != 0) {
+        if (gate_active && ready &&
+            s->bb_ble_evt_ea_env_addr != 0 && gate_link != 0 &&
+            !s->bb_ble_evt_parked) {
             /*
-             * Park the arbiter on no current element while the first
-             * connection event is armed.  The blob's IRAM
-             * r_ea_finetimer_isr uses the current element's target for its
-             * due check, and the pagescan/inquiry-scan elements left there by
-             * the earlier activities have targets in the past.  The hardware
-             * would have stopped them at their own expiry; without a baseband
-             * they never were, so the model clears the stale current slot for
-             * the hand-off.  This is model state repair, not silicon timing.
+             * Park the arbiter on no current element once, when the first
+             * connection event is armed.  The fine-timer ISR uses the current
+             * element's target for its due check, and the
+             * pagescan/inquiry-scan elements left there by the earlier
+             * activities have targets in the past.  The hardware would have
+             * stopped them at their own expiry; without a baseband they never
+             * were, so the model clears the stale current slot once for the
+             * hand-off.  This is model state repair, not silicon timing.
              */
+            uint32_t oldcurr = esp32_bt_guest_read(
+                s, s->bb_ble_evt_ea_env_addr + s->bb_ble_evt_ea_curr_off, 4);
+
+            s->bb_ble_evt_parked = true;
+            if (oldcurr != 0) {
+                ESP32_BT_LOG(s,
+                              "esp32_bt: EA park curr=%08x -> 0 head=%08x "
+                              "target=%08x clock=%u\n",
+                              oldcurr,
+                              esp32_bt_guest_read(
+                                  s, s->bb_ble_evt_ea_env_addr, 4),
+                              s->ea_target, esp32_bt_bt_clk(s));
+            }
             esp32_bt_guest_write(s,
                                  s->bb_ble_evt_ea_env_addr +
                                  s->bb_ble_evt_ea_curr_off, 0, 4);
@@ -1343,9 +1437,8 @@ static void esp32_bt_ble_evt_poll(void *opaque)
          * and sets the link event state.  The observable is that state byte;
          * once it appears the baseband end window is scheduled.
          */
-        if (esp32_bt_ble_evt_state(s, &link, &tx) &&
-            esp32_bt_guest_read(s, link + s->bb_ble_evt_state_off, 1) ==
-            s->bb_ble_evt_state_value) {
+        if (s->bb_ble_evt_started && !s->bb_ble_evt_end_armed &&
+            esp32_bt_ble_evt_state(s, &link, &tx)) {
             uint32_t inflight = esp32_bt_guest_read(
                 s, link + s->bb_ble_evt_inflight_off, 4);
 
@@ -1414,10 +1507,59 @@ static void esp32_bt_ble_evt_poll(void *opaque)
                    s->bb_ble_evt_poll_ns);
 }
 
+/*
+ * Program the per-activity LL-PDU descriptor from a queued TX element and
+ * account the attached buffer.  This is the radio-side data path: the
+ * descriptor header carries length in bits 15:8 and LLID in 7:0, +6 carries
+ * the buffer index and the attach bit, and the link's pending-packet byte
+ * mirrors r_lld_pdu_data_tx_push (spec/04 §3.11).  Returns false when there
+ * is no queued element.
+ */
+static bool esp32_bt_ble_evt_program(Esp32BtState *s, uint32_t link,
+                                     uint32_t tx, uint32_t *idx_out,
+                                     uint32_t *hdr_out, uint32_t *bufidx_out,
+                                     uint32_t *pend_out)
+{
+    uint32_t idx, len, llid, bufidx, desc, hdr, pend = 0;
+    uint32_t lid = s->bb_ble_evt_handle & 0xffffu;
+
+    if (tx == 0) {
+        *idx_out = 0;
+        *hdr_out = 0;
+        *bufidx_out = 0;
+        *pend_out = 0;
+        return false;
+    }
+    idx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_idx_off, 1);
+    len = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_len_off, 2);
+    llid = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_llid_off, 1);
+    bufidx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_buf_off, 1);
+    desc = s->bb_ble_evt_desc_base + 8u * idx;
+    hdr = ((len & 0xffu) << 8) | (llid & 0xffu);
+
+    esp32_bt_em_write16(s, desc + 0x00, (uint16_t)lid);
+    esp32_bt_em_write16(s, desc + 0x02, (uint16_t)hdr);
+    esp32_bt_em_write16(s, desc + 0x04, (uint16_t)s->bb_ble_evt_txbuf_off);
+    esp32_bt_em_write16(s, desc + 0x06,
+                        (uint16_t)((bufidx & 0xffu) |
+                                   (1u << (s->bb_ble_evt_attach_bit & 15u))));
+
+    if (s->bb_ble_evt_pend_off != 0) {
+        pend = esp32_bt_guest_read(s, link + s->bb_ble_evt_pend_off, 1);
+        pend = (pend + 1u) & 0xffu;
+        esp32_bt_guest_write(s, link + s->bb_ble_evt_pend_off, pend, 1);
+    }
+    *idx_out = idx;
+    *hdr_out = hdr;
+    *bufidx_out = bufidx;
+    *pend_out = pend;
+    return true;
+}
+
 static void esp32_bt_ble_evt_start(void *opaque)
 {
     Esp32BtState *s = ESP32_BT(opaque);
-    uint32_t link = 0, tx = 0, idx, len, llid, desc = 0, hdr;
+    uint32_t link = 0, tx = 0, idx = 0, hdr = 0, desc = 0;
     uint32_t bufidx = 0, pend = 0;
     uint32_t lid = s->bb_ble_evt_handle & 0xffffu;
 
@@ -1431,49 +1573,13 @@ static void esp32_bt_ble_evt_start(void *opaque)
         return;
     }
 
+    esp32_bt_ble_evt_program(s, link, tx, &idx, &hdr, &bufidx, &pend);
     if (tx != 0) {
-        idx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_idx_off, 1);
-        len = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_len_off, 2);
-        llid = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_llid_off, 1);
-        bufidx = esp32_bt_guest_read(s, tx + s->bb_ble_evt_tx_buf_off, 1);
         desc = s->bb_ble_evt_desc_base + 8u * idx;
-        hdr = ((len & 0xffu) << 8) | (llid & 0xffu);
-
         /*
-         * Program the per-activity LL-PDU descriptor from the queued
-         * element.  The header word is the on-air LL header the descriptor
-         * carries: length in bits 15:8, LLID in 7:0.  The low byte of +6 is
-         * the attached TX-buffer index and the attach bit marks the buffer
-         * as owned by the radio; r_em_buf_tx_free only returns the buffer to
-         * the pool when that bit is set (spec/04 §3.11).
+         * Model the LLD PDU programming step: the queued element leaves the TX
+         * queue and joins the in-flight list that r_lld_pdu_check walks.
          */
-        esp32_bt_em_write16(s, desc + 0x00, (uint16_t)lid);
-        esp32_bt_em_write16(s, desc + 0x02, (uint16_t)hdr);
-        esp32_bt_em_write16(s, desc + 0x04, (uint16_t)s->bb_ble_evt_txbuf_off);
-        esp32_bt_em_write16(s, desc + 0x06,
-                            (uint16_t)((bufidx & 0xffu) |
-                                       (1u << (s->bb_ble_evt_attach_bit & 15u))));
-
-        /*
-         * r_lld_pdu_data_tx_push increments the link's pending-packet byte
-         * when it attaches a TX buffer.  Mirror that so the LLD state matches
-         * the controller's own bookkeeping.
-         */
-        if (s->bb_ble_evt_pend_off != 0) {
-            pend = esp32_bt_guest_read(s, link + s->bb_ble_evt_pend_off, 1);
-            pend = (pend + 1u) & 0xffu;
-            esp32_bt_guest_write(s, link + s->bb_ble_evt_pend_off, pend, 1);
-        }
-    } else {
-        idx = 0;
-        hdr = 0;
-    }
-
-    /*
-     * Model the LLD PDU programming step: the queued element leaves the TX
-     * queue and joins the in-flight list that r_lld_pdu_check walks.
-     */
-    if (tx != 0) {
         s->bb_ble_evt_tx = tx;
         esp32_bt_ble_evt_move_inflight(s, link, tx);
     }
@@ -1536,9 +1642,10 @@ static void esp32_bt_ble_evt_end(void *opaque)
     if (!s->bb_ble_evt_inject || s->bb_ble_evt_fired) {
         return;
     }
-    s->bb_ble_evt_fired = true;
 
     if (!esp32_bt_ble_evt_state(s, &link, &tx)) {
+        s->bb_ble_evt_started = false;
+        s->bb_ble_evt_end_armed = false;
         ESP32_BT_LOG(s, "esp32_bt: BLE event end without a link\n");
         return;
     }
@@ -1628,6 +1735,17 @@ static void esp32_bt_ble_evt_end(void *opaque)
                       "esp32_bt: BLE event end status bit %u -> %08x\n",
                       s->bb_ble_evt_end_status_bit, s->rwble_irq_status);
         esp32_bt_update_irqs(s);
+    }
+
+    /*
+     * An empty connection event only burns the next interval: keep the model
+     * watching so the following event, which may carry the queued ACL PDU,
+     * runs through the controller as well.  Stop after a data event.
+     */
+    s->bb_ble_evt_started = false;
+    s->bb_ble_evt_end_armed = false;
+    if (s->bb_ble_evt_tx != 0) {
+        s->bb_ble_evt_fired = true;
     }
 }
 
@@ -2221,6 +2339,24 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
          * program is never pushed (docs/03 §2.1).
          */
         r = esp32_bt_bt_clk(s) & 0x7fffffffu;
+        if (s->ea_diag_pending && s->bb_ble_evt_ea_env_addr != 0) {
+            uint32_t head = esp32_bt_guest_read(
+                s, s->bb_ble_evt_ea_env_addr, 4);
+            uint32_t curr = esp32_bt_guest_read(
+                s, s->bb_ble_evt_ea_env_addr +
+                s->bb_ble_evt_ea_curr_off, 4);
+            uint32_t target = head ? esp32_bt_guest_read(s, head + 8, 4) : 0;
+            uint32_t dur = head ? esp32_bt_guest_read(s, head + 0x19, 1) : 0;
+
+            s->ea_diag_pending = false;
+            ESP32_BT_LOG(s,
+                          "esp32_bt: EA isr clock read=%08x head=%08x "
+                          "curr=%08x target=%08x dur=%02x start=%08x "
+                          "now=%08x clock=%u\n",
+                          r, head, curr, target, dur,
+                          (target - dur) & (uint32_t)ESP32_BT_EA_WRAP_MASK,
+                          esp32_bt_ea_now_slot(s), esp32_bt_bt_clk(s));
+        }
         break;
     case RWBLE_WAKEUP_BOUND:
         r = s->rwbt[off / 4] & ~BT_WAKEUP_SELF_CLEAR;
@@ -2598,6 +2734,10 @@ static void esp32_bt_reset(DeviceState *dev)
     s->bb_ble_evt_armed = false;
     s->bb_ble_evt_fired = false;
     s->bb_ble_evt_events = 0;
+    s->bb_ble_evt_init_elt = 0;
+    s->bb_ble_con_pending = false;
+    s->bb_ble_evt_parked = false;
+    s->bb_ble_evt_started = false;
     s->model_ns = 0;
     s->model_base_ns = 0;
     s->model_base_count = 0;
@@ -2925,6 +3065,8 @@ static Property esp32_bt_properties[] = {
                      bb_ble_evt_ctrl_start, false),
     DEFINE_PROP_UINT32("bb-ble-evt-llm-elt-addr", Esp32BtState,
                        bb_ble_evt_llm_elt_addr, 0),
+    DEFINE_PROP_UINT32("bb-ble-evt-rxwinsz", Esp32BtState,
+                       bb_ble_evt_rxwinsz, 1),
     DEFINE_PROP_UINT32("bb-ble-evt-end-status-bit", Esp32BtState,
                        bb_ble_evt_end_status_bit, 3),
     DEFINE_PROP_BOOL("bb-ble-evt-raise-end", Esp32BtState,

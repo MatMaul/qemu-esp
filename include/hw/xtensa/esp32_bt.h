@@ -251,6 +251,7 @@ typedef struct Esp32BtState {
     bool ea_status_pending;     /* bit 9 raised, not yet acknowledged */
     bool ea_armed;
     uint32_t ea_fires;
+    bool ea_diag_pending;       /* log the arbiter state on the next clock read */
     QEMUTimer *bb_fine_timer;
 
     /*
@@ -359,8 +360,11 @@ typedef struct Esp32BtState {
     bool bb_ble_evt_start_push;
     bool bb_ble_evt_ctrl_start;
     uint32_t bb_ble_evt_llm_elt_addr;
+    uint32_t bb_ble_evt_rxwinsz;
     uint32_t bb_ble_evt_init_elt;
     bool bb_ble_con_pending;
+    bool bb_ble_evt_parked;
+    bool bb_ble_evt_started;
     uint32_t bb_ble_evt_end_status_bit;
     bool bb_ble_evt_raise_end;
     uint32_t bb_ble_evt_rx_status_bit;
