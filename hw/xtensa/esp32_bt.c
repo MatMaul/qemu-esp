@@ -1085,14 +1085,21 @@ static void esp32_bt_tx_watch_arm_start(Esp32BtState *s)
  *   1. poll the link's TX list (`link + txlist_off`) until it is non-empty;
  *   2. at the event-start tick, read the queued element's descriptor index,
  *      length and LLID, assign the link id and program the descriptor at
- *      `desc_base + 8*index` with payload offset `txbuf_off`, then model the
- *      LLD event-start transition: set the link event state (`link +
- *      state_off`), publish the link as the EA current element (`ea_env +
- *      ea_curr_off`) and push it onto the current-event list (`list_addr`);
+ *      `desc_base + 8*index` with payload offset `txbuf_off`.  It then models
+ *      the LLD PDU programming step: the queued element moves from the TX
+ *      queue (`txlist_off`) onto the in-flight list (`inflight_off`), so the
+ *      controller's `r_lld_pdu_check` can consume it after the baseband
+ *      acknowledgement.  Finally it models the LLD event-start transition:
+ *      set the link event state (`link + state_off`), publish the link as the
+ *      EA current element (`ea_env + ea_curr_off`) and push it onto the
+ *      current-event list (`list_addr`);
  *   3. at the event-end tick, read the descriptor and payload back (the
- *      baseband read) and optionally raise the RWBLE event-end status bit.
- *      The controller's `r_lld_evt_end_isr` then pops the current-event list
- *      and runs `r_lld_evt_end` with the modelled state.
+ *      baseband read), set the descriptor TX-done bit and raise the RWBLE RX
+ *      status bit, which the controller's `r_lld_evt_rx_isr`/`r_lld_evt_rx`
+ *      turns into a deferred LLD element.  The deferred handler runs
+ *      `r_lld_pdu_check`, frees the acknowledged PDU and emits the HCI
+ *      completion.  Optionally it also raises the event-end status bit, which
+ *      runs `r_lld_evt_end_isr`/`r_lld_evt_end` with the modelled state.
  *
  * The descriptor layout and field positions are the ones claimed for the
  * BLE EM region (spec/04 §3.10); the timing and every address are model
@@ -1145,6 +1152,50 @@ static bool esp32_bt_ble_evt_state(Esp32BtState *s, uint32_t *link_out,
     return true;
 }
 
+/*
+ * Model the LLD PDU programming step.  r_lld_pdu_tx_prog packs the queued
+ * element into the EM TX buffer and appends it to the PDU context's in-flight
+ * list (pdu + 48), which r_lld_pdu_check walks after a baseband
+ * acknowledgement.  Move the element from the TX queue to that list so the
+ * controller can consume it on its own deferred-element path.
+ */
+static void esp32_bt_ble_evt_move_inflight(Esp32BtState *s, uint32_t link,
+                                           uint32_t tx)
+{
+    uint32_t next, head, tail, qtail;
+
+    if (!s->bb_ble_evt_inflight_move || tx == 0) {
+        return;
+    }
+    next = esp32_bt_guest_read(s, tx, 4);
+    head = esp32_bt_guest_read(s, link + s->bb_ble_evt_inflight_off, 4);
+    tail = esp32_bt_guest_read(s, link + s->bb_ble_evt_inflight_tail_off, 4);
+    if (head == 0) {
+        head = tx;
+        tail = tx;
+    } else {
+        if (tail == 0) {
+            tail = head;
+        }
+        esp32_bt_guest_write(s, tail, tx, 4);
+        tail = tx;
+    }
+    esp32_bt_guest_write(s, tx, 0, 4);
+    esp32_bt_guest_write(s, link + s->bb_ble_evt_inflight_off, head, 4);
+    esp32_bt_guest_write(s, link + s->bb_ble_evt_inflight_tail_off, tail, 4);
+
+    /* Pop the element from the TX queue and repair its tail if needed. */
+    esp32_bt_guest_write(s, link + s->bb_ble_evt_txlist_off, next, 4);
+    qtail = esp32_bt_guest_read(s, link + s->bb_ble_evt_txlist_tail_off, 4);
+    if (qtail == tx) {
+        esp32_bt_guest_write(s, link + s->bb_ble_evt_txlist_tail_off, next, 4);
+    }
+    ESP32_BT_LOG(s,
+                  "esp32_bt: BLE PDU in-flight link=%08x tx=%08x head=%08x "
+                  "tail=%08x next=%08x clock=%u\n",
+                  link, tx, head, tail, next, esp32_bt_bt_clk(s));
+}
+
 static void esp32_bt_ble_evt_poll(void *opaque)
 {
     Esp32BtState *s = ESP32_BT(opaque);
@@ -1172,7 +1223,7 @@ static void esp32_bt_ble_evt_poll(void *opaque)
 static void esp32_bt_ble_evt_start(void *opaque)
 {
     Esp32BtState *s = ESP32_BT(opaque);
-    uint32_t link = 0, tx = 0, idx, len, llid, desc, hdr;
+    uint32_t link = 0, tx = 0, idx, len, llid, desc = 0, hdr;
     uint32_t bufidx = 0, pend = 0;
     uint32_t lid = s->bb_ble_evt_handle & 0xffffu;
 
@@ -1224,6 +1275,15 @@ static void esp32_bt_ble_evt_start(void *opaque)
         hdr = 0;
     }
 
+    /*
+     * Model the LLD PDU programming step: the queued element leaves the TX
+     * queue and joins the in-flight list that r_lld_pdu_check walks.
+     */
+    if (tx != 0) {
+        s->bb_ble_evt_tx = tx;
+        esp32_bt_ble_evt_move_inflight(s, link, tx);
+    }
+
     /* Assign the connection's link id. */
     esp32_bt_guest_write(s, link + s->bb_ble_evt_lid_off, lid, 2);
 
@@ -1252,9 +1312,10 @@ static void esp32_bt_ble_evt_start(void *opaque)
     s->bb_ble_evt_events++;
     ESP32_BT_LOG(s,
                   "esp32_bt: BLE event start link=%08x lid=%04x desc=%02x "
-                  "hdr=%04x off=%04x buf=%02x pend=%02x state=%02x ea=%08x "
-                  "list=%08x events=%u clock=%u\n",
+                  "hdr=%04x off=%04x buf=%02x pend=%02x d6=%04x state=%02x "
+                  "ea=%08x list=%08x events=%u clock=%u\n",
                   link, lid, idx, hdr, s->bb_ble_evt_txbuf_off, bufidx, pend,
+                  tx != 0 ? esp32_bt_em_read16(s, desc + 0x06) : 0,
                   esp32_bt_guest_read(s,
                                       link + s->bb_ble_evt_state_off, 1),
                   s->bb_ble_evt_ea_env_addr != 0 ?
@@ -1286,6 +1347,13 @@ static void esp32_bt_ble_evt_end(void *opaque)
     if (!esp32_bt_ble_evt_state(s, &link, &tx)) {
         ESP32_BT_LOG(s, "esp32_bt: BLE event end without a link\n");
         return;
+    }
+    /*
+     * The queued element moved to the in-flight list at the start tick; use
+     * the pointer recorded then (the TX queue may be empty by the event end).
+     */
+    if (s->bb_ble_evt_tx != 0) {
+        tx = s->bb_ble_evt_tx;
     }
     if (tx == 0) {
         ESP32_BT_LOG(s, "esp32_bt: BLE event end without a queued element\n");
@@ -1323,6 +1391,20 @@ static void esp32_bt_ble_evt_end(void *opaque)
                       "off=%04x len=%u llid=%u payload=%s ack=%04x clock=%u\n",
                       link, idx, hdr, off, len, llid, hex, ack,
                       esp32_bt_bt_clk(s));
+    }
+
+    if (s->bb_ble_evt_raise_rx) {
+        /*
+         * The baseband RX interrupt carries the acknowledgement of the PDU
+         * the radio just sent: r_lld_evt_rx_isr -> r_lld_evt_rx pushes a
+         * deferred element (type 0) and sets KE event 9, whose handler runs
+         * r_lld_pdu_check on the PDU context.  Raise it before the event-end
+         * bit so the current-event list still names the link.
+         */
+        s->rwble_irq_status |= 1u << (s->bb_ble_evt_rx_status_bit & 31u);
+        ESP32_BT_LOG(s, "esp32_bt: BLE event rx status bit %u -> %08x\n",
+                     s->bb_ble_evt_rx_status_bit, s->rwble_irq_status);
+        esp32_bt_update_irqs(s);
     }
 
     if (s->bb_ble_evt_raise_end) {
@@ -2587,6 +2669,14 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_link_off, 16),
     DEFINE_PROP_UINT32("bb-ble-evt-txlist-off", Esp32BtState,
                        bb_ble_evt_txlist_off, 48),
+    DEFINE_PROP_UINT32("bb-ble-evt-txlist-tail-off", Esp32BtState,
+                       bb_ble_evt_txlist_tail_off, 52),
+    DEFINE_PROP_UINT32("bb-ble-evt-inflight-off", Esp32BtState,
+                       bb_ble_evt_inflight_off, 88),
+    DEFINE_PROP_UINT32("bb-ble-evt-inflight-tail-off", Esp32BtState,
+                       bb_ble_evt_inflight_tail_off, 92),
+    DEFINE_PROP_BOOL("bb-ble-evt-inflight-move", Esp32BtState,
+                     bb_ble_evt_inflight_move, true),
     DEFINE_PROP_UINT32("bb-ble-evt-lid-off", Esp32BtState,
                        bb_ble_evt_lid_off, 104),
     DEFINE_PROP_UINT32("bb-ble-evt-tx-idx-off", Esp32BtState,
@@ -2627,6 +2717,10 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_end_status_bit, 3),
     DEFINE_PROP_BOOL("bb-ble-evt-raise-end", Esp32BtState,
                      bb_ble_evt_raise_end, false),
+    DEFINE_PROP_UINT32("bb-ble-evt-rx-status-bit", Esp32BtState,
+                       bb_ble_evt_rx_status_bit, 1),
+    DEFINE_PROP_BOOL("bb-ble-evt-raise-rx", Esp32BtState,
+                     bb_ble_evt_raise_rx, false),
     DEFINE_PROP_UINT64("bb-ble-evt-poll-ns", Esp32BtState,
                        bb_ble_evt_poll_ns, 200000),
     DEFINE_PROP_UINT64("bb-ble-evt-start-delay-ns", Esp32BtState,

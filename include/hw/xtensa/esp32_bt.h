@@ -325,6 +325,10 @@ typedef struct Esp32BtState {
     uint32_t bb_ble_evt_handle;
     uint32_t bb_ble_evt_link_off;
     uint32_t bb_ble_evt_txlist_off;
+    uint32_t bb_ble_evt_txlist_tail_off;
+    uint32_t bb_ble_evt_inflight_off;
+    uint32_t bb_ble_evt_inflight_tail_off;
+    bool bb_ble_evt_inflight_move;
     uint32_t bb_ble_evt_lid_off;
     uint32_t bb_ble_evt_tx_idx_off;
     uint32_t bb_ble_evt_tx_len_off;
@@ -345,11 +349,14 @@ typedef struct Esp32BtState {
     bool bb_ble_evt_start_push;
     uint32_t bb_ble_evt_end_status_bit;
     bool bb_ble_evt_raise_end;
+    uint32_t bb_ble_evt_rx_status_bit;
+    bool bb_ble_evt_raise_rx;
     uint64_t bb_ble_evt_poll_ns;
     uint64_t bb_ble_evt_start_delay_ns;
     uint64_t bb_ble_evt_duration_ns;
     bool bb_ble_evt_armed;
     bool bb_ble_evt_fired;
+    uint32_t bb_ble_evt_tx;
     uint32_t bb_ble_evt_events;
     QEMUTimer *bb_ble_evt_poll_timer;
     QEMUTimer *bb_ble_evt_start_timer;
