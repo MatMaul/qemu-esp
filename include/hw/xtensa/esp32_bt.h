@@ -254,6 +254,16 @@ typedef struct Esp32BtState {
     QEMUTimer *bb_fine_timer;
 
     /*
+     * Opt-in bank selection for the modelled fine-timer expiry.  The real
+     * hardware raises the expiry in the bank that owns the programmed
+     * activity: RWBT status bit 9 for BR/EDR and RWBLE status bit 7 for BLE.
+     * Both dispatch to r_ea_finetimer_isr, but the guest acknowledges them
+     * through different registers (0x018 vs 0x218).
+     */
+    bool bb_ea_rwble;
+    uint32_t bb_ea_ble_status_bit;
+
+    /*
      * Opt-in state-based RX injection trigger.  When
      * bb-rx-watch-addr is non-zero the model polls that guest address and arms
      * the one-shot frame injection only after it becomes non-zero.  The
@@ -347,6 +357,10 @@ typedef struct Esp32BtState {
     uint32_t bb_ble_evt_state_off;
     uint32_t bb_ble_evt_state_value;
     bool bb_ble_evt_start_push;
+    bool bb_ble_evt_ctrl_start;
+    uint32_t bb_ble_evt_llm_elt_addr;
+    uint32_t bb_ble_evt_init_elt;
+    bool bb_ble_con_pending;
     uint32_t bb_ble_evt_end_status_bit;
     bool bb_ble_evt_raise_end;
     uint32_t bb_ble_evt_rx_status_bit;
@@ -356,6 +370,7 @@ typedef struct Esp32BtState {
     uint64_t bb_ble_evt_duration_ns;
     bool bb_ble_evt_armed;
     bool bb_ble_evt_fired;
+    bool bb_ble_evt_end_armed;
     uint32_t bb_ble_evt_tx;
     uint32_t bb_ble_evt_events;
     QEMUTimer *bb_ble_evt_poll_timer;

@@ -349,6 +349,11 @@ static void esp32_bt_cancel(Esp32BtState *s, int id, QEMUTimer *timer)
 static void esp32_bt_model_advance(Esp32BtState *s);
 static void esp32_bt_model_anchor(Esp32BtState *s, const char *why);
 static void esp32_bt_model_anchor_release(Esp32BtState *s);
+static uint32_t esp32_bt_guest_read(Esp32BtState *s, uint32_t addr, size_t size);
+static void esp32_bt_guest_write(Esp32BtState *s, uint32_t addr, uint32_t v,
+                                 size_t size);
+static bool esp32_bt_ble_evt_state(Esp32BtState *s, uint32_t *link_out,
+                                   uint32_t *tx_out);
 static Esp32BtState *esp32_bt_plugin_state;
 
 static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
@@ -801,12 +806,62 @@ static void esp32_bt_ea_fire(void *opaque)
         }
         s->clock_hold_until = esp32_bt_now_ns(s) + 200000;
     }
-    s->rwbt_irq_status |= 1u << RWBT_EA_STATUS_BIT;
+    if (s->bb_ea_rwble) {
+        s->rwble_irq_status |= 1u << (s->bb_ea_ble_status_bit & 31u);
+    } else {
+        s->rwbt_irq_status |= 1u << RWBT_EA_STATUS_BIT;
+    }
     ESP32_BT_LOG(s,
                   "esp32_bt: EA fine fire n=%u target=%08x now=%08x "
                   "status=%08x clock=%u\n",
                   s->ea_fires, s->ea_target, esp32_bt_ea_now_slot(s),
-                  s->rwbt_irq_status, esp32_bt_bt_clk(s));
+                  s->bb_ea_rwble ? s->rwble_irq_status : s->rwbt_irq_status,
+                  esp32_bt_bt_clk(s));
+    if (s->bb_ble_evt_ea_env_addr != 0) {
+        /*
+         * Name the elements the controller's arbiter will run.  ea_env+0 is
+         * the list head, ea_env+0x14 the current element; an element carries
+         * next at +0, target at +8, interval at +0xc, flags at +0x10,
+         * durations at +0x18/+0x19/+0x1a, the start callback at +0x1c and the
+         * stop/cancel callbacks at +0x20/+0x24 (from r_ea_elt_insert and
+         * r_ea_finetimer_isr).  Logged so the EA hand-off is observable
+         * without a gdb pass.
+         */
+        uint32_t elt = esp32_bt_guest_read(s, s->bb_ble_evt_ea_env_addr, 4);
+        uint32_t curr = esp32_bt_guest_read(s,
+                             s->bb_ble_evt_ea_env_addr +
+                             s->bb_ble_evt_ea_curr_off, 4);
+        uint32_t sw = esp32_bt_guest_read(s,
+                             s->bb_ble_evt_ea_env_addr + 0x40, 4);
+        int i;
+
+        ESP32_BT_LOG(s,
+                      "esp32_bt: EA fine list head=%08x curr=%08x "
+                      "sw=%08x clock=%u\n",
+                      elt, curr, sw, esp32_bt_bt_clk(s));
+        for (i = 0; i < 4 && elt != 0; i++) {
+            uint32_t next = esp32_bt_guest_read(s, elt, 4);
+            uint32_t target = esp32_bt_guest_read(s, elt + 8, 4);
+            uint32_t interval = esp32_bt_guest_read(s, elt + 0xc, 4);
+            uint32_t flags = esp32_bt_guest_read(s, elt + 0x10, 2);
+            uint32_t start = esp32_bt_guest_read(s, elt + 0x1c, 4);
+            uint32_t stop = esp32_bt_guest_read(s, elt + 0x20, 4);
+            uint32_t cancel = esp32_bt_guest_read(s, elt + 0x24, 4);
+
+            ESP32_BT_LOG(s,
+                          "esp32_bt: EA fine elt[%d]=%08x next=%08x "
+                          "target=%08x interval=%08x flags=%04x "
+                          "start=%08x stop=%08x cancel=%08x "
+                          "b16=%02x b17=%02x b18=%02x b19=%02x\n",
+                          i, elt, next, target, interval, flags,
+                          start, stop, cancel,
+                          esp32_bt_guest_read(s, elt + 0x16, 1),
+                          esp32_bt_guest_read(s, elt + 0x17, 1),
+                          esp32_bt_guest_read(s, elt + 0x18, 1),
+                          esp32_bt_guest_read(s, elt + 0x19, 1));
+            elt = next;
+        }
+    }
     esp32_bt_update_irqs(s);
 }
 
@@ -817,6 +872,80 @@ static void esp32_bt_ea_rearm(Esp32BtState *s)
 
     if (!s->bb_ea_model) {
         return;
+    }
+    /*
+     * Controller-driven BLE event start: hold the fine timer only while the
+     * LLM create-connection transaction is in flight.  llm_elt+4 holds the
+     * pending request element and returns to zero when r_llm_con_req_tx_cfm
+     * consumes it.  Firing the initiator event tears down the state that the
+     * harness-injected peer confirmation needs, so the model waits for that
+     * transaction and leaves every other activity to the controller's own
+     * arbiter.
+     */
+    if (s->bb_ble_evt_ctrl_start) {
+        bool ready = true;
+        uint32_t gate_link = 0;
+        uint32_t gate_target = 0;
+
+        if (s->bb_ble_evt_llm_elt_addr != 0) {
+            uint32_t cur = esp32_bt_guest_read(
+                s, s->bb_ble_evt_llm_elt_addr + 4, 4);
+
+            /*
+             * r_lld_con_start publishes the initiator request element at
+             * llm_elt+4 and r_llm_con_req_tx_cfm consumes it, which clears
+             * the word before the established link stores its own element.
+             * The gate samples on every fine-timer register access, which is
+             * frequent enough inside the confirmation to see that transient.
+             * Only after it is observed may the arbiter run: an initiator
+             * event would otherwise end before the harness-injected peer
+             * confirmation arrives.
+             */
+            if (cur != 0) {
+                s->bb_ble_evt_init_elt = cur;
+            } else if (s->bb_ble_evt_init_elt != 0) {
+                s->bb_ble_con_pending = true;
+            }
+            if (!s->bb_ble_con_pending) {
+                ready = false;
+            }
+        }
+        if (ready) {
+            uint32_t link = 0, tx = 0;
+
+            if (esp32_bt_ble_evt_state(s, &link, &tx)) {
+                gate_link = link;
+                gate_target = esp32_bt_guest_read(s, link + 8, 4);
+            }
+        }
+        if (!ready) {
+            esp32_bt_cancel(s, ESP32_BT_TMR_EA_FINE, s->bb_fine_timer);
+            s->ea_armed = false;
+            ESP32_BT_LOG(s,
+                          "esp32_bt: EA gate hold pending=%d seen=%d "
+                          "link=%08x elt_target=%08x target=%08x clock=%u\n",
+                          s->bb_ble_evt_llm_elt_addr != 0 ?
+                          (int)esp32_bt_guest_read(s,
+                              s->bb_ble_evt_llm_elt_addr + 4, 4) : -1,
+                          s->bb_ble_con_pending, gate_link, gate_target,
+                          s->ea_target, esp32_bt_bt_clk(s));
+            return;
+        }
+        if (s->bb_ble_evt_ea_env_addr != 0 && gate_link != 0) {
+            /*
+             * Park the arbiter on no current element while the first
+             * connection event is armed.  The blob's IRAM
+             * r_ea_finetimer_isr uses the current element's target for its
+             * due check, and the pagescan/inquiry-scan elements left there by
+             * the earlier activities have targets in the past.  The hardware
+             * would have stopped them at their own expiry; without a baseband
+             * they never were, so the model clears the stale current slot for
+             * the hand-off.  This is model state repair, not silicon timing.
+             */
+            esp32_bt_guest_write(s,
+                                 s->bb_ble_evt_ea_env_addr +
+                                 s->bb_ble_evt_ea_curr_off, 0, 4);
+        }
     }
     if (!s->ea_mask_enabled || !s->ea_target_valid || s->ea_status_pending) {
         esp32_bt_cancel(s, ESP32_BT_TMR_EA_FINE, s->bb_fine_timer);
@@ -1203,6 +1332,71 @@ static void esp32_bt_ble_evt_poll(void *opaque)
 
     if (!s->bb_ble_evt_inject || s->bb_ble_evt_fired) {
         s->bb_ble_evt_armed = false;
+        return;
+    }
+    if (s->bb_ble_evt_ctrl_start) {
+        /*
+         * Controller-driven start: the model no longer synthesises the
+         * event.  It waits for the controller's own event arbiter (the RWBT
+         * 0x0b8 / RWBLE fine timer, driven by the bb-ea-timer model) to run
+         * r_lld_evt_start, which programs the descriptor, assigns the link id
+         * and sets the link event state.  The observable is that state byte;
+         * once it appears the baseband end window is scheduled.
+         */
+        if (esp32_bt_ble_evt_state(s, &link, &tx) &&
+            esp32_bt_guest_read(s, link + s->bb_ble_evt_state_off, 1) ==
+            s->bb_ble_evt_state_value) {
+            uint32_t inflight = esp32_bt_guest_read(
+                s, link + s->bb_ble_evt_inflight_off, 4);
+
+            s->bb_ble_evt_tx = inflight ? inflight : tx;
+            s->bb_ble_evt_end_armed = true;
+            ESP32_BT_LOG(s,
+                          "esp32_bt: BLE controller event start "
+                          "link=%08x lid=%04x tx=%08x inflight=%08x "
+                          "state=%02x clock=%u\n",
+                          link,
+                          esp32_bt_guest_read(s,
+                              link + s->bb_ble_evt_lid_off, 2),
+                          tx, inflight,
+                          esp32_bt_guest_read(s,
+                              link + s->bb_ble_evt_state_off, 1),
+                          esp32_bt_bt_clk(s));
+            esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_END,
+                           s->bb_ble_evt_end_timer,
+                           s->bb_ble_evt_duration_ns);
+            return;
+        }
+        if (s->bb_ea_model && esp32_bt_ble_evt_state(s, &link, &tx)) {
+            /*
+             * Diagnostic only: name the connection element the controller
+             * inserted.  The fine timer itself is armed by the 0x0b8 writes
+             * through esp32_bt_ea_rearm, so no scheduling happens here.
+             */
+            uint32_t etarget = esp32_bt_guest_read(s, link + 8, 4);
+
+            if (etarget != 0 && !s->bb_ble_evt_end_armed) {
+                ESP32_BT_LOG(s,
+                              "esp32_bt: BLE EA element link=%08x "
+                              "next=%08x target=%08x state=%02x clock=%u\n",
+                              link, esp32_bt_guest_read(s, link, 4),
+                              etarget,
+                              esp32_bt_guest_read(s,
+                                  link + s->bb_ble_evt_state_off, 1),
+                              esp32_bt_bt_clk(s));
+            }
+        }
+        if (s->bb_ea_model) {
+            /*
+             * Once the connection transaction has completed there may be no
+             * further RWBT 0x0b8 write (the controller programmed its target
+             * while the gate held).  Re-evaluate the gate here so the stored
+             * target is armed as soon as the arbiter may run.
+             */
+            esp32_bt_ea_rearm(s);
+        }
+        esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_WATCH,
+                       s->bb_ble_evt_poll_timer, s->bb_ble_evt_poll_ns);
         return;
     }
     if (esp32_bt_ble_evt_state(s, &link, &tx) && tx != 0) {
@@ -2133,6 +2327,17 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         s->rwble_irq_status &= ~v;
         s->rwbt[off / 4] = v;
         esp32_bt_update_irqs(s);
+
+        /*
+         * r_rwble_isr() acknowledges the BLE fine-timer expiry through this
+         * register before it dispatches r_ea_finetimer_isr.  Clear the
+         * pending marker so the next programmed target can arm again.
+         */
+        if (s->bb_ea_rwble &&
+            (v & (1u << (s->bb_ea_ble_status_bit & 31u)))) {
+            s->ea_status_pending = false;
+            esp32_bt_ea_rearm(s);
+        }
         break;
     case RWBT_ISR_ENABLE:
         s->rwbt_irq_enable = v;
@@ -2608,6 +2813,9 @@ static Property esp32_bt_properties[] = {
      * 625 us slot target is reached; see docs/09 §3.8.
      */
     DEFINE_PROP_BOOL("bb-ea-timer", Esp32BtState, bb_ea_model, false),
+    DEFINE_PROP_BOOL("bb-ea-rwble", Esp32BtState, bb_ea_rwble, false),
+    DEFINE_PROP_UINT32("bb-ea-ble-status-bit", Esp32BtState,
+                       bb_ea_ble_status_bit, 7),
 
     /*
      * Opt-in state-based RX trigger.  When bb-rx-watch-addr is
@@ -2713,6 +2921,10 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_state_value, 1),
     DEFINE_PROP_BOOL("bb-ble-evt-start-push", Esp32BtState,
                      bb_ble_evt_start_push, true),
+    DEFINE_PROP_BOOL("bb-ble-evt-ctrl-start", Esp32BtState,
+                     bb_ble_evt_ctrl_start, false),
+    DEFINE_PROP_UINT32("bb-ble-evt-llm-elt-addr", Esp32BtState,
+                       bb_ble_evt_llm_elt_addr, 0),
     DEFINE_PROP_UINT32("bb-ble-evt-end-status-bit", Esp32BtState,
                        bb_ble_evt_end_status_bit, 3),
     DEFINE_PROP_BOOL("bb-ble-evt-raise-end", Esp32BtState,
