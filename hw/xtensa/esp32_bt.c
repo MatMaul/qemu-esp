@@ -374,6 +374,29 @@ static uint32_t esp32_bt_ble_evt_slots(uint32_t us)
     return (uint32_t)((((uint64_t)us * 0xd1b71759ull) >> 32) >> 9);
 }
 
+/*
+ * Decode the LLD's RX-window end.  `link + 0x78` is a 32-bit word whose low
+ * half is the slot-unit timestamp at which the radio closes the receive
+ * window and whose high half (`link + 0x7a`) is the connection-event counter
+ * the LLD maintains for the activity.  `r_lld_evt_schedule` derives
+ * `rxwinsz = window_end - target` from the same word.  A zero or implausibly
+ * wrapped window cannot describe the upcoming event, so the caller supplies
+ * the fallback (the LLD duration converted to slots).
+ */
+static uint32_t esp32_bt_ble_evt_window(Esp32BtState *s, uint32_t link,
+                                        uint32_t target, uint32_t *count_out,
+                                        uint32_t fallback)
+{
+    uint32_t word = esp32_bt_guest_read(s, link + s->bb_ble_evt_window_off, 4);
+    uint32_t win = ((word & 0xffffu) - (target & 0xffffu)) & 0xffffu;
+
+    *count_out = word >> 16;
+    if (win == 0 || win > 0x3fffu) {
+        return fallback;
+    }
+    return win;
+}
+
 static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
 {
     /* BR/EDR and BLE native clock: one tick is 312.5 us. */
@@ -950,15 +973,40 @@ static void esp32_bt_ea_fire(void *opaque)
                     }
                     interval = esp32_bt_guest_read(
                         s, link + s->bb_ble_evt_interval_off, 2);
-                    esp32_bt_guest_write(
-                        s, link + 0x78,
-                        (target + win_slots) & 0xffffu, 2);
+                    if (s->bb_ble_evt_end_cond) {
+                        /*
+                         * Reuse the window end the controller maintained for
+                         * the previous event when it still describes this
+                         * target.  r_lld_evt_restart writes `+0x78` after the
+                         * event it just finished, so the field is usually one
+                         * event behind; seed it from the LLD duration only
+                         * when it cannot describe this target.
+                         */
+                        uint32_t count = 0;
+                        uint32_t win = esp32_bt_ble_evt_window(
+                            s, link, target, &count, 0);
+
+                        if (win == 0) {
+                            win = win_slots;
+                            esp32_bt_guest_write(
+                                s, link + s->bb_ble_evt_window_off,
+                                (((target + win) & 0xffffu) |
+                                 (count << 16)), 4);
+                        }
+                        s->bb_ble_evt_window_slots = win;
+                        s->bb_ble_evt_window_count = count;
+                    } else {
+                        esp32_bt_guest_write(
+                            s, link + s->bb_ble_evt_window_off,
+                            (target + win_slots) & 0xffffu, 2);
+                    }
                     ESP32_BT_LOG(s,
                                   "esp32_bt: BLE event timing win=%uus "
                                   "wslots=%u interval=%04x end=%08x "
                                   "clock=%u\n",
                                   win_us, win_slots, interval,
-                                  esp32_bt_guest_read(s, link + 0x78, 4),
+                                  esp32_bt_guest_read(
+                                      s, link + s->bb_ble_evt_window_off, 4),
                                   esp32_bt_bt_clk(s));
                 } else if (s->bb_ble_evt_rxwinsz != 0) {
                     /*
@@ -969,7 +1017,7 @@ static void esp32_bt_ea_fire(void *opaque)
                      * window size.
                      */
                     esp32_bt_guest_write(
-                        s, link + 0x78,
+                        s, link + s->bb_ble_evt_window_off,
                         (target + s->bb_ble_evt_rxwinsz) & 0xffffu, 2);
                 }
                 esp32_bt_guest_write(s, link + s->bb_ble_evt_state_off,
@@ -1557,6 +1605,60 @@ static void esp32_bt_ble_evt_poll(void *opaque)
                           esp32_bt_guest_read(s,
                               link + s->bb_ble_evt_state_off, 1),
                           esp32_bt_bt_clk(s));
+            if (s->bb_ble_evt_end_cond) {
+                /*
+                 * Connection-event end condition.  The controller's RX-window
+                 * end at `link + 0x78` (low half) and its event counter at
+                 * `+0x7a` (high half) describe when the baseband closes the
+                 * listen window.  The activity is idle when it has neither a
+                 * queued nor an in-flight PDU and the pending-packet byte is
+                 * zero; otherwise the end is the RX-window close after the
+                 * exchange.  Both cases end at the controller's window, not at
+                 * a duration constant.
+                 */
+                uint32_t target = esp32_bt_guest_read(s, link + 8, 4);
+                uint32_t count = 0, pend = 0;
+                uint32_t win = esp32_bt_ble_evt_window(
+                    s, link, target, &count, 0);
+                bool idle = inflight == 0 && tx == 0;
+
+                if (s->bb_ble_evt_pend_off != 0) {
+                    pend = esp32_bt_guest_read(
+                        s, link + s->bb_ble_evt_pend_off, 1);
+                    if (pend != 0) {
+                        idle = false;
+                    }
+                }
+                if (win == 0) {
+                    /* No controller window describes this target yet. */
+                    uint32_t win_us = esp32_bt_guest_read(
+                        s, link + s->bb_ble_evt_duration_off, 2);
+
+                    win = esp32_bt_ble_evt_slots(win_us);
+                    if (win == 0) {
+                        win = 1;
+                    }
+                    esp32_bt_guest_write(
+                        s, link + s->bb_ble_evt_window_off,
+                        (((target + win) & 0xffffu) | (count << 16)), 4);
+                }
+                s->bb_ble_evt_window_slots = win;
+                s->bb_ble_evt_window_count = count;
+                s->bb_ble_evt_idle = idle;
+                ESP32_BT_LOG(s,
+                              "esp32_bt: BLE event end condition "
+                              "window=%08x target=%08x win=%u count=%u "
+                              "pend=%02x inflight=%08x cause=%s clock=%u\n",
+                              esp32_bt_guest_read(
+                                  s, link + s->bb_ble_evt_window_off, 4),
+                              target, win, count, pend, inflight,
+                              idle ? "idle" : "rx-window",
+                              esp32_bt_bt_clk(s));
+                esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_END,
+                               s->bb_ble_evt_end_timer,
+                               (uint64_t)win * 625000ull);
+                return;
+            }
             if (s->bb_ble_evt_ctrl_timing) {
                 /*
                  * End the event after the duration the LLD wrote for the
@@ -1882,6 +1984,20 @@ static void esp32_bt_ble_evt_end(void *opaque)
 
     esp32_bt_ble_evt_end_env(s, link);
     if (tx == 0) {
+        if (s->bb_ble_evt_end_cond && s->bb_ble_evt_idle) {
+            ESP32_BT_LOG(s,
+                          "esp32_bt: BLE idle event end link=%08x "
+                          "window=%08x win=%u count=%u state=%02x "
+                          "clock=%u\n",
+                          link,
+                          esp32_bt_guest_read(
+                              s, link + s->bb_ble_evt_window_off, 4),
+                          s->bb_ble_evt_window_slots,
+                          s->bb_ble_evt_window_count,
+                          esp32_bt_guest_read(s,
+                              link + s->bb_ble_evt_state_off, 1),
+                          esp32_bt_bt_clk(s));
+        }
         ESP32_BT_LOG(s,
                       "esp32_bt: BLE empty event end link=%08x state=%02x "
                       "clock=%u\n",
@@ -1966,6 +2082,9 @@ static void esp32_bt_ble_evt_end(void *opaque)
     s->bb_ble_evt_started = false;
     s->bb_ble_evt_end_armed = false;
     s->bb_ble_evt_wait = 0;
+    s->bb_ble_evt_idle = false;
+    s->bb_ble_evt_window_slots = 0;
+    s->bb_ble_evt_window_count = 0;
     if (s->bb_ble_evt_tx != 0) {
         s->bb_ble_evt_fired = true;
     }
@@ -3298,10 +3417,14 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_rxwinsz, 1),
     DEFINE_PROP_BOOL("bb-ble-evt-ctrl-timing", Esp32BtState,
                      bb_ble_evt_ctrl_timing, false),
+    DEFINE_PROP_BOOL("bb-ble-evt-end-cond", Esp32BtState,
+                     bb_ble_evt_end_cond, false),
     DEFINE_PROP_UINT32("bb-ble-evt-duration-off", Esp32BtState,
                        bb_ble_evt_duration_off, 0x12),
     DEFINE_PROP_UINT32("bb-ble-evt-interval-off", Esp32BtState,
                        bb_ble_evt_interval_off, 0x94),
+    DEFINE_PROP_UINT32("bb-ble-evt-window-off", Esp32BtState,
+                       bb_ble_evt_window_off, 0x78),
     DEFINE_PROP_BOOL("bb-ble-evt-empty-start", Esp32BtState,
                      bb_ble_evt_empty_start, false),
     DEFINE_PROP_BOOL("bb-ble-evt-end-env", Esp32BtState,
