@@ -362,6 +362,18 @@ static void esp32_bt_ble_evt_move_inflight(Esp32BtState *s, uint32_t link,
                                            uint32_t tx);
 static Esp32BtState *esp32_bt_plugin_state;
 
+/*
+ * Convert an event duration in microseconds to 625 us slot units with the
+ * same 0xd1b71759 multiply-high and >>9 step the ROM uses in
+ * r_lld_evt_move_to_master and r_lld_evt_restart.  Keeping the arithmetic
+ * identical makes the modelled RX window the value the LLD itself derives
+ * from `link + 0x12`.
+ */
+static uint32_t esp32_bt_ble_evt_slots(uint32_t us)
+{
+    return (uint32_t)((((uint64_t)us * 0xd1b71759ull) >> 32) >> 9);
+}
+
 static uint32_t esp32_bt_bt_clk(Esp32BtState *s)
 {
     /* BR/EDR and BLE native clock: one tick is 312.5 us. */
@@ -904,6 +916,7 @@ static void esp32_bt_ea_fire(void *opaque)
 
             if (start == (s->ea_target & ESP32_BT_EA_WRAP_MASK)) {
                 uint32_t idx, hdr, bufidx, pend;
+                uint32_t win_us = 0, win_slots = 0, interval = 0;
 
                 s->bb_ble_evt_started = true;
                 s->bb_ble_evt_wait = 0;
@@ -913,13 +926,48 @@ static void esp32_bt_ea_fire(void *opaque)
                 s->bb_ble_evt_tx = tx;
                 esp32_bt_guest_write(s, link + s->bb_ble_evt_lid_off,
                                      s->bb_ble_evt_handle & 0xffffu, 2);
-                /*
-                 * The LLD event-start path derives the RX window size from
-                 * link+0x78 minus the event target.  In silicon the baseband
-                 * fills that field when it activates the activity; without it
-                 * r_lld_evt_schedule asserts on the window size.
-                 */
-                if (s->bb_ble_evt_rxwinsz != 0) {
+                if (s->bb_ble_evt_ctrl_timing) {
+                    /*
+                     * Derive the event window and duration from the LLD's
+                     * own event state instead of the model constants.
+                     *
+                     * `link + 0x12` is the event duration in microseconds
+                     * that r_lld_evt_move_to_master hands to the radio
+                     * descriptor (it converts it to slots with the same
+                     * 0xd1b71759 / 2^41 step used here).  The RX window end
+                     * at `link + 0x78` follows the arbiter duration, so the
+                     * baseband programming matches the value the LLD will
+                     * read back in r_lld_evt_schedule.  `link + 0x94` is the
+                     * connection interval in slot units, which the controller
+                     * adds to the target for the next event; it is logged so
+                     * the interval advance is attributable to controller state.
+                     */
+                    win_us = esp32_bt_guest_read(
+                        s, link + s->bb_ble_evt_duration_off, 2);
+                    win_slots = esp32_bt_ble_evt_slots(win_us);
+                    if (win_slots == 0) {
+                        win_slots = 1;
+                    }
+                    interval = esp32_bt_guest_read(
+                        s, link + s->bb_ble_evt_interval_off, 2);
+                    esp32_bt_guest_write(
+                        s, link + 0x78,
+                        (target + win_slots) & 0xffffu, 2);
+                    ESP32_BT_LOG(s,
+                                  "esp32_bt: BLE event timing win=%uus "
+                                  "wslots=%u interval=%04x end=%08x "
+                                  "clock=%u\n",
+                                  win_us, win_slots, interval,
+                                  esp32_bt_guest_read(s, link + 0x78, 4),
+                                  esp32_bt_bt_clk(s));
+                } else if (s->bb_ble_evt_rxwinsz != 0) {
+                    /*
+                     * The LLD event-start path derives the RX window size
+                     * from link+0x78 minus the event target.  In silicon the
+                     * baseband fills that field when it activates the
+                     * activity; without it r_lld_evt_schedule asserts on the
+                     * window size.
+                     */
                     esp32_bt_guest_write(
                         s, link + 0x78,
                         (target + s->bb_ble_evt_rxwinsz) & 0xffffu, 2);
@@ -1509,6 +1557,24 @@ static void esp32_bt_ble_evt_poll(void *opaque)
                           esp32_bt_guest_read(s,
                               link + s->bb_ble_evt_state_off, 1),
                           esp32_bt_bt_clk(s));
+            if (s->bb_ble_evt_ctrl_timing) {
+                /*
+                 * End the event after the duration the LLD wrote for the
+                 * radio descriptor rather than the model's fixed tick.  The
+                 * field is re-read here because the start block ran before
+                 * r_lld_evt_schedule and the controller may have refreshed
+                 * it while programming the event.
+                 */
+                uint32_t win_us = esp32_bt_guest_read(
+                    s, link + s->bb_ble_evt_duration_off, 2);
+
+                if (win_us != 0) {
+                    esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_END,
+                                   s->bb_ble_evt_end_timer,
+                                   (uint64_t)win_us * 1000ull);
+                    return;
+                }
+            }
             esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_END,
                            s->bb_ble_evt_end_timer,
                            s->bb_ble_evt_duration_ns);
@@ -3230,6 +3296,12 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_llm_elt_addr, 0),
     DEFINE_PROP_UINT32("bb-ble-evt-rxwinsz", Esp32BtState,
                        bb_ble_evt_rxwinsz, 1),
+    DEFINE_PROP_BOOL("bb-ble-evt-ctrl-timing", Esp32BtState,
+                     bb_ble_evt_ctrl_timing, false),
+    DEFINE_PROP_UINT32("bb-ble-evt-duration-off", Esp32BtState,
+                       bb_ble_evt_duration_off, 0x12),
+    DEFINE_PROP_UINT32("bb-ble-evt-interval-off", Esp32BtState,
+                       bb_ble_evt_interval_off, 0x94),
     DEFINE_PROP_BOOL("bb-ble-evt-empty-start", Esp32BtState,
                      bb_ble_evt_empty_start, false),
     DEFINE_PROP_BOOL("bb-ble-evt-end-env", Esp32BtState,

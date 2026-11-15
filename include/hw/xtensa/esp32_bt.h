@@ -361,6 +361,9 @@ typedef struct Esp32BtState {
     bool bb_ble_evt_ctrl_start;
     uint32_t bb_ble_evt_llm_elt_addr;
     uint32_t bb_ble_evt_rxwinsz;
+    bool bb_ble_evt_ctrl_timing;
+    uint32_t bb_ble_evt_duration_off;
+    uint32_t bb_ble_evt_interval_off;
     bool bb_ble_evt_empty_start;
     bool bb_ble_evt_end_env;
     uint32_t bb_ble_evt_act_base;
