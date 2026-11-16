@@ -1627,6 +1627,12 @@ static void esp32_bt_ble_evt_poll(void *opaque)
                 uint32_t win = esp32_bt_ble_evt_window(
                     s, link, target, &count, 0);
                 bool idle = inflight == 0 && tx == 0;
+                /* A response is posted at this event's end unless the peer
+                 * budget is exhausted. */
+                bool will_reply = s->bb_ble_evt_peer &&
+                    !s->bb_ble_evt_peer_sent &&
+                    (s->bb_ble_evt_peer_limit == 0 ||
+                     s->bb_ble_evt_peer_posted < s->bb_ble_evt_peer_limit);
 
                 if (s->bb_ble_evt_pend_off != 0) {
                     pend = esp32_bt_guest_read(
@@ -1660,7 +1666,7 @@ static void esp32_bt_ble_evt_poll(void *opaque)
                  * the end tick, before the RX status bit.
                  */
                 end_slots = win;
-                if (s->bb_ble_evt_peer) {
+                if (will_reply) {
                     uint32_t resp_slots =
                         (uint32_t)((s->bb_ble_evt_peer_delay_ns + 624999) /
                                    625000);
@@ -1679,9 +1685,9 @@ static void esp32_bt_ble_evt_poll(void *opaque)
                               esp32_bt_guest_read(
                                   s, link + s->bb_ble_evt_window_off, 4),
                               target, win, count, pend, inflight,
-                              s->bb_ble_evt_peer ? "exchange" :
+                              will_reply ? "exchange" :
                               (idle ? "idle" : "rx-window"),
-                              s->bb_ble_evt_peer ? " resp=1" : "",
+                              will_reply ? " resp=1" : "",
                               esp32_bt_bt_clk(s));
                 esp32_bt_sched(s, ESP32_BT_TMR_BLE_EVT_END,
                                s->bb_ble_evt_end_timer,
@@ -1926,6 +1932,8 @@ static bool esp32_bt_ble_evt_peer_reply(Esp32BtState *s, uint32_t link)
     int pos = 0;
 
     if (!s->bb_ble_evt_peer || s->bb_ble_evt_peer_sent ||
+        (s->bb_ble_evt_peer_limit != 0 &&
+         s->bb_ble_evt_peer_posted >= s->bb_ble_evt_peer_limit) ||
         s->bb_ble_evt_rx_idx_addr == 0 || s->bb_ble_evt_rx_desc_count == 0) {
         return false;
     }
@@ -1982,6 +1990,7 @@ static bool esp32_bt_ble_evt_peer_reply(Esp32BtState *s, uint32_t link)
     esp32_bt_guest_write(s, act, word, 2);
 
     s->bb_ble_evt_peer_sent = true;
+    s->bb_ble_evt_peer_posted++;
 
     for (i = 0; i < len && i < 48; i++) {
         pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", payload[i]);
@@ -2263,7 +2272,7 @@ static void esp32_bt_ble_evt_end(void *opaque)
     s->bb_ble_evt_peer_sent = false;
     s->bb_ble_evt_window_slots = 0;
     s->bb_ble_evt_window_count = 0;
-    if (s->bb_ble_evt_tx != 0) {
+    if (s->bb_ble_evt_tx != 0 || tx != 0) {
         s->bb_ble_evt_fired = true;
     }
     s->bb_ble_evt_tx = 0;
@@ -3637,6 +3646,8 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_rx_idx_addr, 0),
     DEFINE_PROP_UINT32("bb-ble-evt-rx-buf-field", Esp32BtState,
                        bb_ble_evt_rx_buf_field, 0x08),
+    DEFINE_PROP_UINT32("bb-ble-evt-peer-limit", Esp32BtState,
+                       bb_ble_evt_peer_limit, 0),
     DEFINE_PROP_UINT32("bb-ble-evt-end-state", Esp32BtState,
                        bb_ble_evt_end_state, 0),
     DEFINE_PROP_UINT32("bb-ble-evt-end-status-bit", Esp32BtState,

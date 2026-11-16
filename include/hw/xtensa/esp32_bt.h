@@ -395,6 +395,14 @@ typedef struct Esp32BtState {
     uint32_t bb_ble_evt_rx_idx_addr;
     uint32_t bb_ble_evt_rx_buf_field;
     bool bb_ble_evt_peer_sent;
+    /*
+     * Peer PDU budget (opt-in bb-ble-evt-peer-limit).  Zero keeps the old
+     * one-response-per-event behaviour; a non-zero value caps the total posted
+     * over the session, so a later event can carry the controller's own LLCP
+     * reply instead of another peer request.
+     */
+    uint32_t bb_ble_evt_peer_limit;
+    uint32_t bb_ble_evt_peer_posted;
     uint32_t bb_ble_evt_end_state;
     uint32_t bb_ble_evt_init_elt;
     bool bb_ble_con_pending;
