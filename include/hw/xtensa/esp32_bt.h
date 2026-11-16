@@ -375,6 +375,26 @@ typedef struct Esp32BtState {
     uint32_t bb_ble_evt_act_stride;
     uint32_t bb_ble_evt_act_comp_off;
     uint32_t bb_ble_evt_rx_pdus;
+    /*
+     * Peer-side PDU model (opt-in bb-ble-evt-peer).  At the event end the
+     * model posts what the peer's response to the master's PDU would have
+     * carried into the controller's em_buf RX ring, reports it through the
+     * per-activity RX count and ends the event at the response time instead
+     * of the RX-window close, so the controller's own r_lld_evt_rx /
+     * r_lld_pdu_rx_handler path consumes the received PDU.
+     */
+    bool bb_ble_evt_peer;
+    uint32_t bb_ble_evt_peer_llid;
+    uint32_t bb_ble_evt_peer_cat;
+    uint32_t bb_ble_evt_peer_len;
+    char *bb_ble_evt_peer_payload;
+    uint64_t bb_ble_evt_peer_delay_ns;
+    uint32_t bb_ble_evt_rx_desc_base;
+    uint32_t bb_ble_evt_rx_desc_stride;
+    uint32_t bb_ble_evt_rx_desc_count;
+    uint32_t bb_ble_evt_rx_idx_addr;
+    uint32_t bb_ble_evt_rx_buf_field;
+    bool bb_ble_evt_peer_sent;
     uint32_t bb_ble_evt_end_state;
     uint32_t bb_ble_evt_init_elt;
     bool bb_ble_con_pending;
