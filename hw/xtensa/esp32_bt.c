@@ -1897,7 +1897,7 @@ static void esp32_bt_ble_evt_start(void *opaque)
  *
  *   +0x00  u16  RX status/control; any bit in 0x13f drops the packet
  *   +0x02  u16  bits 15:11 = link id (compared with link + 104)
- *   +0x04  u16  bits 15:8 = length, bits 1:0 = PDU category (3 = ACL data)
+ *   +0x04  u16  bits 15:8 = length, bits 1:0 = LLID
  *   +0x06  u16  status word (bit 15 + bits 13:8)
  *   +0x08  u16  EM offset of the RX payload buffer
  *
@@ -1956,14 +1956,14 @@ static bool esp32_bt_ble_evt_peer_reply(Esp32BtState *s, uint32_t link)
     }
 
     /*
-     * PDU category.  The controller branches on the descriptor's low two
-     * flag bits: 3 is the ACL-data path, 1 the LL-control path and 0 drops the
-     * packet.  Derive it from the LLID unless the slice overrides it.
+     * The descriptor's low two bits carry the LLID, not an independent PDU
+     * category: 3 = LL control, 2 = start of an LL data (L2CAP) PDU, 1 =
+     * continuation, 0 = empty.  r_lld_pdu_rx_handler branches on this field,
+     * so derive it from the LLID unless the slice overrides it.
      */
     cat = s->bb_ble_evt_peer_cat;
     if (cat == 0) {
-        cat = s->bb_ble_evt_peer_llid == 1 ? 1 :
-              (s->bb_ble_evt_peer_llid != 0 ? 3 : 0);
+        cat = s->bb_ble_evt_peer_llid & 3u;
     }
     esp32_bt_em_write16(s, desc + 0x00, 0);
     esp32_bt_em_write16(s, desc + 0x02, (uint16_t)(lid << 11));
