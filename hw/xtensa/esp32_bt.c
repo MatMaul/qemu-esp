@@ -115,6 +115,23 @@
 #define RWBT_RX_STATUS_BIT   1
 #define RWBT_EA_STATUS_BIT   9
 #define RWBT_SW_STATUS_BIT   16
+/*
+ * KE (kernel event) timer comparator.
+ *
+ * ke_timer_hw_set() programs the absolute 10 ms target in RWBT 0x0b4 and
+ * enables the mask at RWBT 0x00c bit 10.  ke_time() is
+ * r_ea_time_get_halfslot_rounded() >> 4 masked to 23 bits, so the target and
+ * that time source share units.  The real block raises status bit 10 at the
+ * target; r_rwbt_isr() dispatches it to r_ke_event_set().  The opt-in
+ * bb-ke-timer model reproduces that comparator so the controller's own
+ * software timers (supervision timeout, channel assessment, ...) expire.
+ */
+#define RWBT_KE_TARGET       0x0b4
+#define RWBT_KE_STATUS_BIT   10
+#define RWBT_KE_MASK         (1u << RWBT_KE_STATUS_BIT)
+#define ESP32_BT_KE_UNIT_NS  10000000ull
+#define ESP32_BT_KE_WRAP     0x7fffffu
+#define ESP32_BT_KE_HALF     0x3fffffu
 #define RWBT_EA_MAX_TICKS    400
 
 /*
@@ -283,6 +300,7 @@ enum {
     ESP32_BT_TMR_BLE_EVT_WATCH,
     ESP32_BT_TMR_BLE_EVT_START,
     ESP32_BT_TMR_BLE_EVT_END,
+    ESP32_BT_TMR_KE,
     ESP32_BT_TMR_COUNT,
 };
 
@@ -446,6 +464,143 @@ static void esp32_bt_update_irqs(Esp32BtState *s)
      */
     qemu_set_irq(s->irq_rwbt, s->rwbt_irq_status != 0);
     qemu_set_irq(s->irq_rwble, s->rwble_irq_status != 0);
+}
+
+/*
+ * Opt-in KE timer comparator (bb-ke-timer).
+ *
+ * The controller's ke_time() is
+ * ((((RWBT_0x01c & 0x0fffffff) + 1) >> 1) >> 4) & 0x7fffff, i.e. 10 ms units
+ * (r_ea_time_get_halfslot_rounded() followed by a >> 4 in ROM ke_time).
+ * ke_timer_hw_set() stores the absolute target in RWBT 0x0b4 and enables the
+ * interrupt at 0x00c bit 10.  The model schedules one expiry and raises
+ * RWBT status bit 10, which r_rwbt_isr() dispatches to r_ke_event_set(); the
+ * controller then runs its own timer list.  This is opt-in so the earlier
+ * slices keep their captured behaviour.
+ */
+static uint32_t esp32_bt_ke_now(Esp32BtState *s)
+{
+    uint32_t raw = esp32_bt_bt_clk(s) & ESP32_BT_EA_TIME_MASK;
+
+    /* r_ea_time_get_halfslot_rounded() >> 4, masked like ROM ke_time(). */
+    return ((((raw + 1) >> 1) >> 4) & ESP32_BT_KE_WRAP);
+}
+
+/*
+ * Walk the controller's KE timer list (ke_env+40) for the modelled timer.
+ * The list is sorted by target and every node stores next at +0, task id at
+ * +4, timer id at +6 and the absolute target at +8 (ROM ke_timer_schedule and
+ * r_ke_timer_set).  Only the matching timer is modelled; the LLD/LLM periodic
+ * timers drive activities whose baseband side is absent, and expiring them
+ * resets the controller.
+ */
+static uint32_t esp32_bt_ke_find(Esp32BtState *s)
+{
+    uint32_t node;
+    int i;
+
+    if (s->bb_ke_env_addr == 0) {
+        return 0;
+    }
+    node = esp32_bt_guest_read(s, s->bb_ke_env_addr + 40, 4);
+    for (i = 0; i < 16 && node != 0; i++) {
+        uint32_t task = esp32_bt_guest_read(s, node + 4, 2);
+        uint32_t id = esp32_bt_guest_read(s, node + 6, 2);
+
+        if ((s->bb_ke_task == 0xffffffffu || task == s->bb_ke_task) &&
+            (s->bb_ke_timer_id == 0xffffffffu ||
+             id == s->bb_ke_timer_id)) {
+            return node;
+        }
+        node = esp32_bt_guest_read(s, node, 4);
+    }
+    return 0;
+}
+
+static void esp32_bt_ke_fire(void *opaque)
+{
+    Esp32BtState *s = ESP32_BT(opaque);
+    uint32_t node, head;
+
+    if (!s->bb_ke_timer || !s->ke_target_valid) {
+        return;
+    }
+    node = s->ke_node;
+    if (node == 0 || esp32_bt_ke_find(s) != node) {
+        return;
+    }
+    head = esp32_bt_guest_read(s, s->bb_ke_env_addr + 40, 4);
+    if (node != head) {
+        /*
+         * Promote the supervision timer to the list head so the controller's
+         * ke_timer_schedule() sees it as the earliest entry.  Its earlier
+         * neighbours are LLD/LLM housekeeping timers whose baseband side is
+         * not modelled; leaving them ahead would make the controller process
+         * those first.
+         */
+        esp32_bt_guest_write(s, node, head, 4);
+        esp32_bt_guest_write(s, s->bb_ke_env_addr + 40, node, 4);
+    }
+    esp32_bt_guest_write(s, node + 8,
+                         esp32_bt_ke_now(s) & ESP32_BT_KE_WRAP, 4);
+    s->ke_pending = true;
+    s->ke_target_valid = false;
+    s->ke_node = 0;
+    s->rwbt_irq_status |= RWBT_KE_MASK;
+    ESP32_BT_LOG(s,
+                  "esp32_bt: KE supervision expire node=%08x target=%08x "
+                  "now=%08x status=%08x clock=%u\n",
+                  node, s->ke_target, esp32_bt_ke_now(s), s->rwbt_irq_status,
+                  esp32_bt_bt_clk(s));
+    esp32_bt_update_irqs(s);
+}
+
+static void esp32_bt_ke_arm(Esp32BtState *s)
+{
+    uint32_t now;
+    uint32_t delta;
+    uint64_t delay_ns;
+
+    if (!s->bb_ke_timer || !s->ke_target_valid || s->ke_pending) {
+        esp32_bt_cancel(s, ESP32_BT_TMR_KE, s->ke_timer);
+        return;
+    }
+    now = esp32_bt_ke_now(s);
+    delta = (s->ke_target - now) & ESP32_BT_KE_WRAP;
+    if (delta == 0 || delta > ESP32_BT_KE_HALF) {
+        delay_ns = 1000000;  /* due: let the guest leave the caller first */
+    } else {
+        delay_ns = (uint64_t)delta * ESP32_BT_KE_UNIT_NS;
+    }
+    esp32_bt_sched(s, ESP32_BT_TMR_KE, s->ke_timer, delay_ns);
+}
+
+static void esp32_bt_ke_scan(Esp32BtState *s)
+{
+    uint32_t node;
+
+    if (!s->bb_ke_timer) {
+        return;
+    }
+    node = esp32_bt_ke_find(s);
+    if (node == 0) {
+        s->ke_node = 0;
+        s->ke_target_valid = false;
+        esp32_bt_cancel(s, ESP32_BT_TMR_KE, s->ke_timer);
+        return;
+    }
+    if (s->ke_node == node && s->ke_target_valid) {
+        uint32_t target = esp32_bt_guest_read(s, node + 8, 4);
+
+        if (target == s->ke_target) {
+            return;
+        }
+    }
+    s->ke_node = node;
+    s->ke_target = esp32_bt_guest_read(s, node + 8, 4);
+    s->ke_target_valid = true;
+    s->ke_pending = false;
+    esp32_bt_ke_arm(s);
 }
 
 /*
@@ -2448,6 +2603,9 @@ static void esp32_bt_fire_one(Esp32BtState *s, int id)
     case ESP32_BT_TMR_BLE_EVT_END:
         esp32_bt_ble_evt_end(s);
         break;
+    case ESP32_BT_TMR_KE:
+        esp32_bt_ke_fire(s);
+        break;
     }
 }
 
@@ -2900,6 +3058,9 @@ static uint64_t esp32_bt_rwbt_read(void *opaque, hwaddr addr, unsigned int size)
     case RWBLE_CLK_LO:
         r = esp32_bt_bt_clk(s);
         break;
+    case RWBT_KE_TARGET:
+        r = s->rwbt[off / 4];
+        break;
     case RWBLE_CLK_HI:
         r = 0;
         break;
@@ -2957,6 +3118,10 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
     case RWBT_IRQ_CLEAR:
         s->rwbt_irq_status &= ~v;
         s->rwbt[off / 4] = v;
+        if (v & RWBT_KE_MASK) {
+            s->ke_pending = false;
+            esp32_bt_cancel(s, ESP32_BT_TMR_KE, s->ke_timer);
+        }
         esp32_bt_update_irqs(s);
 
         /*
@@ -3017,6 +3182,13 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
         s->rwbt[off / 4] = v;
         s->ea_mask_enabled = (v >> RWBT_EA_STATUS_BIT) & 1u;
         esp32_bt_ea_rearm(s);
+        if (s->bb_ke_timer && !(v & RWBT_KE_MASK)) {
+            esp32_bt_cancel(s, ESP32_BT_TMR_KE, s->ke_timer);
+        }
+        break;
+    case RWBT_KE_TARGET:
+        s->rwbt[off / 4] = v;
+        esp32_bt_ke_scan(s);
         break;
     case RWBT_EA_TARGET:
         /* The inquiry command programs its first fine target here. */
@@ -3266,6 +3438,11 @@ static void esp32_bt_reset(DeviceState *dev)
     esp32_bt_cancel(s, ESP32_BT_TMR_BLE_EVT_WATCH, s->bb_ble_evt_poll_timer);
     esp32_bt_cancel(s, ESP32_BT_TMR_BLE_EVT_START, s->bb_ble_evt_start_timer);
     esp32_bt_cancel(s, ESP32_BT_TMR_BLE_EVT_END, s->bb_ble_evt_end_timer);
+    esp32_bt_cancel(s, ESP32_BT_TMR_KE, s->ke_timer);
+    s->ke_target = 0;
+    s->ke_node = 0;
+    s->ke_target_valid = false;
+    s->ke_pending = false;
     s->bb_ble_evt_armed = false;
     s->bb_ble_evt_fired = false;
     s->bb_ble_evt_events = 0;
@@ -3351,6 +3528,8 @@ static void esp32_bt_init(Object *obj)
                                              esp32_bt_ble_evt_start, s);
     s->bb_ble_evt_end_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                            esp32_bt_ble_evt_end, s);
+    s->ke_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                               esp32_bt_ke_fire, s);
     s->model_idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        esp32_bt_model_idle, s);
 }
@@ -3488,6 +3667,13 @@ static Property esp32_bt_properties[] = {
      * 625 us slot target is reached; see docs/09 §3.8.
      */
     DEFINE_PROP_BOOL("bb-ea-timer", Esp32BtState, bb_ea_model, false),
+    /* Opt-in KE timer comparator (RWBT 0x0b4 / 0x00c bit 10 -> status bit 10). */
+    DEFINE_PROP_BOOL("bb-ke-timer", Esp32BtState, bb_ke_timer, false),
+    /* Optional task/id filter for the modelled KE timer. */
+    DEFINE_PROP_UINT32("bb-ke-env-addr", Esp32BtState, bb_ke_env_addr, 0),
+    DEFINE_PROP_UINT32("bb-ke-task", Esp32BtState, bb_ke_task, 0xffffffffu),
+    DEFINE_PROP_UINT32("bb-ke-timer-id", Esp32BtState, bb_ke_timer_id,
+                       0xffffffffu),
     DEFINE_PROP_BOOL("bb-ea-rwble", Esp32BtState, bb_ea_rwble, false),
     DEFINE_PROP_UINT32("bb-ea-ble-status-bit", Esp32BtState,
                        bb_ea_ble_status_bit, 7),

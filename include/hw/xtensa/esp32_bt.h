@@ -148,6 +148,26 @@ typedef struct Esp32BtState {
     bool wakeup_end_armed;
 
     /*
+     * Opt-in KE (kernel event) timer comparator model.
+     *
+     * The controller arms its software timers through ke_timer_hw_set(), which
+     * writes the absolute 10 ms target to RWBT 0x0b4 and enables the interrupt
+     * mask at RWBT 0x00c bit 10.  The real block raises RWBT status bit 10 when
+     * that target is reached; r_rwbt_isr() then calls r_ke_event_set() and the
+     * controller runs its own timer list.  Without it the KE timers never
+     * expire (the supervision-timeout path never runs).  Disabled by default.
+     */
+    bool bb_ke_timer;
+    uint32_t bb_ke_env_addr;
+    uint32_t bb_ke_task;
+    uint32_t bb_ke_timer_id;
+    bool ke_target_valid;
+    bool ke_pending;
+    uint32_t ke_target;
+    uint32_t ke_node;
+    QEMUTimer *ke_timer;
+
+    /*
      * Opt-in RWBLE status-bit probe (parent project Q4e).  Disabled by default: the
      * default property value selects no bit, so the model behaves exactly as
      * before.  When enabled it raises ONE bit in RWBLE_IRQ_STATUS (0x210)
