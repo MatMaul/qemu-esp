@@ -408,6 +408,14 @@ typedef struct Esp32BtState {
     uint32_t bb_ble_evt_peer_cat;
     uint32_t bb_ble_evt_peer_len;
     char *bb_ble_evt_peer_payload;
+    /*
+     * Ordered peer payloads (opt-in bb-ble-evt-peer-payloads).  A
+     * semicolon-separated list; the n-th posted peer PDU uses the n-th
+     * segment, and the last one repeats once the list is exhausted.  It lets
+     * a slice answer a multi-PDU procedure (LL_ENC_RSP then
+     * LL_START_ENC_RSP) without changing the single-payload property.
+     */
+    char *bb_ble_evt_peer_payloads;
     uint64_t bb_ble_evt_peer_delay_ns;
     uint32_t bb_ble_evt_rx_desc_base;
     uint32_t bb_ble_evt_rx_desc_stride;
@@ -423,6 +431,22 @@ typedef struct Esp32BtState {
      */
     uint32_t bb_ble_evt_peer_limit;
     uint32_t bb_ble_evt_peer_posted;
+    /*
+     * Reply only after the controller transmitted a PDU in this event
+     * (opt-in bb-ble-evt-peer-after-tx).  The encrypted-link procedure needs
+     * it: the peer's LL_ENC_RSP must follow the controller's LL_ENC_REQ, not
+     * arrive unsolicited in an empty event.
+     */
+    bool bb_ble_evt_peer_after_tx;
+    /*
+     * Opt-in BLE AES block model (bb-ble-aes).  r_llm_encryption_start writes
+     * the 128-bit key to RWBLE 0x2c4..0x2d0 and the EM input offset to 0x2d4,
+     * then starts the block with bit 0 of 0x2c0.  The model encrypts the 16
+     * bytes at em_base + offset, writes the result 16 bytes later and raises
+     * the crypto-completion IRQ status bit 4 (r_lld_crypt_isr).
+     */
+    bool bb_ble_aes;
+    uint32_t bb_ble_aes_em_base;
     uint32_t bb_ble_evt_end_state;
     uint32_t bb_ble_evt_init_elt;
     bool bb_ble_con_pending;

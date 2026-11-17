@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "crypto/aes.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
 #include "exec/address-spaces.h"
@@ -80,6 +81,26 @@
 #define RWBLE_IRQ_ACK      0x22c
 #define RWBLE_INIT_CTRL    0x250
 #define RWBLE_STATUS       0x260
+/*
+ * BLE AES block (r_llm_encryption_start / r_lld_crypt_isr).
+ *
+ *  0x2c4..0x2d0  128-bit key, four little-endian key words (byte order of the
+ *                LTK as the host supplied it);
+ *  0x2d4         16-bit EM input offset (the value 0x0096 addresses
+ *                0x3ffb0096 in the modelled EM window);
+ *  0x2c0         start bit 0; the block clears it and, on completion, raises
+ *                RWBLE IRQ status bit 4 (r_lld_crypt_isr through
+ *                r_ip_funcs_p + 0x934).
+ *
+ * r_llm_encryption_start copies the 16-byte plaintext to the input offset and
+ * reads the ciphertext back at offset + 16, so the block works on a 32-byte
+ * EM scratch (16 in, 16 out).
+ */
+#define RWBLE_AES_CTRL     0x2c0
+#define RWBLE_AES_KEY0     0x2c4
+#define RWBLE_AES_ADDR     0x2d4
+#define RWBLE_AES_STATUS_BIT 4
+#define RWBLE_AES_DONE     (1u << RWBLE_AES_STATUS_BIT)
 
 /*
  * Default RWBLE probe trigger: 0x2a0 is written once by r_lld_adv_start when
@@ -1639,6 +1660,67 @@ static void esp32_bt_guest_write(Esp32BtState *s, uint32_t addr,
                         &v, size);
 }
 
+/*
+ * Opt-in BLE AES block (bb-ble-aes).  The BLE baseband owns a 128-bit AES
+ * engine next to the RWBLE registers; the ROM's r_llm_encryption_start loads
+ * the key, points 0x2d4 at a 16-byte EM input and starts the block, and
+ * r_llm_encryption_done reads the ciphertext from the following 16 bytes
+ * after r_lld_crypt_isr runs.  Without the completion interrupt the LLC
+ * encryption state machine stops in its wait state and never queues
+ * LL_ENC_REQ, so the model runs a real AES-128 encryption and raises IRQ
+ * status bit 4 (the identity of which is verified in spec/03 §2.3b).
+ */
+static bool esp32_bt_ble_aes_start(Esp32BtState *s)
+{
+    uint8_t key[16], in[16], out[16];
+    uint32_t off = s->rwbt[RWBLE_AES_ADDR / 4] & 0xffffu;
+    uint32_t addr = s->bb_ble_aes_em_base + off;
+    AES_KEY aes;
+    int i;
+
+    if (!s->bb_ble_aes) {
+        return false;
+    }
+    for (i = 0; i < 4; i++) {
+        uint32_t w = s->rwbt[(RWBLE_AES_KEY0 + 4 * i) / 4];
+
+        key[4 * i + 0] = w;
+        key[4 * i + 1] = w >> 8;
+        key[4 * i + 2] = w >> 16;
+        key[4 * i + 3] = w >> 24;
+    }
+    for (i = 0; i < 16; i += 4) {
+        uint32_t w = esp32_bt_guest_read(s, addr + i, 4);
+
+        in[i + 0] = w;
+        in[i + 1] = w >> 8;
+        in[i + 2] = w >> 16;
+        in[i + 3] = w >> 24;
+    }
+    AES_set_encrypt_key(key, 128, &aes);
+    AES_encrypt(in, out, &aes);
+    for (i = 0; i < 16; i += 4) {
+        uint32_t w = out[i] | (out[i + 1] << 8) |
+                     (out[i + 2] << 16) | ((uint32_t)out[i + 3] << 24);
+
+        esp32_bt_guest_write(s, addr + 16 + i, w, 4);
+    }
+    s->rwble_irq_status |= RWBLE_AES_DONE;
+    esp32_bt_update_irqs(s);
+    ESP32_BT_LOG(s,
+                 "esp32_bt: BLE AES start off=%04x in=%02x%02x%02x%02x"
+                 "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x "
+                 "out=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
+                 "%02x%02x%02x%02x status=%08x\n",
+                 off,
+                 in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7],
+                 in[8], in[9], in[10], in[11], in[12], in[13], in[14], in[15],
+                 out[0], out[1], out[2], out[3], out[4], out[5], out[6],
+                 out[7], out[8], out[9], out[10], out[11], out[12], out[13],
+                 out[14], out[15], s->rwble_irq_status);
+    return true;
+}
+
 /* Resolve llc_env[handle] -> link object -> queued TX element. */
 static bool esp32_bt_ble_evt_state(Esp32BtState *s, uint32_t *link_out,
                                    uint32_t *tx_out)
@@ -1786,6 +1868,9 @@ static void esp32_bt_ble_evt_poll(void *opaque)
                  * budget is exhausted. */
                 bool will_reply = s->bb_ble_evt_peer &&
                     !s->bb_ble_evt_peer_sent &&
+                    (!s->bb_ble_evt_peer_after_tx ||
+                     s->bb_ble_evt_tx != 0 ||
+                     s->bb_ble_evt_peer_posted != 0) &&
                     (s->bb_ble_evt_peer_limit == 0 ||
                      s->bb_ble_evt_peer_posted < s->bb_ble_evt_peer_limit);
 
@@ -2078,15 +2163,50 @@ static uint32_t esp32_bt_ble_evt_rx_count(Esp32BtState *s)
     return s->bb_ble_evt_rx_pdus + (s->bb_ble_evt_peer_sent ? 1u : 0u);
 }
 
+/*
+ * Select the n-th element of a semicolon-separated peer payload list.  When
+ * the list is shorter than n the last element is returned, so a two-entry
+ * list keeps answering with its final element if the controller asks again.
+ */
+static bool esp32_bt_peer_payload_segment(const char *list, uint32_t n,
+                                          char *out, size_t size)
+{
+    const char *p = list;
+    uint32_t i = 0;
+
+    if (!list || !list[0] || size == 0) {
+        return false;
+    }
+    for (;;) {
+        const char *end = strchr(p, ';');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+
+        if (i == n || !end) {
+            if (len >= size) {
+                len = size - 1;
+            }
+            memcpy(out, p, len);
+            out[len] = 0;
+            return out[0] != 0;
+        }
+        p = end + 1;
+        i++;
+    }
+}
+
 static bool esp32_bt_ble_evt_peer_reply(Esp32BtState *s, uint32_t link)
 {
     uint32_t idx, desc, buf_off, len, cat, i, act, word;
     uint8_t payload[ESP32_BT_RX_MAX_PAYLOAD];
     uint16_t lid = s->bb_ble_evt_handle & 0xffffu;
     char hex[3 * 48 + 1];
+    char segment[3 * 48 + 1];
+    const char *payload_hex = s->bb_ble_evt_peer_payload;
     int pos = 0;
 
     if (!s->bb_ble_evt_peer || s->bb_ble_evt_peer_sent ||
+        (s->bb_ble_evt_peer_after_tx && s->bb_ble_evt_tx == 0 &&
+         s->bb_ble_evt_peer_posted == 0) ||
         (s->bb_ble_evt_peer_limit != 0 &&
          s->bb_ble_evt_peer_posted >= s->bb_ble_evt_peer_limit) ||
         s->bb_ble_evt_rx_idx_addr == 0 || s->bb_ble_evt_rx_desc_count == 0) {
@@ -2095,8 +2215,13 @@ static bool esp32_bt_ble_evt_peer_reply(Esp32BtState *s, uint32_t link)
 
     len = 0;
     memset(payload, 0, sizeof(payload));
-    if (s->bb_ble_evt_peer_payload && s->bb_ble_evt_peer_payload[0]) {
-        len = esp32_bt_parse_hex_payload(s->bb_ble_evt_peer_payload, payload,
+    if (esp32_bt_peer_payload_segment(s->bb_ble_evt_peer_payloads,
+                                      s->bb_ble_evt_peer_posted, segment,
+                                      sizeof(segment))) {
+        payload_hex = segment;
+    }
+    if (payload_hex && payload_hex[0]) {
+        len = esp32_bt_parse_hex_payload(payload_hex, payload,
                                          sizeof(payload));
         if (len == 0) {
             ESP32_BT_LOG(s, "esp32_bt: BLE peer PDU skipped: invalid "
@@ -3159,6 +3284,16 @@ static void esp32_bt_rwbt_write(void *opaque, hwaddr addr,
                            s->wakeup_end_timer, s->wakeup_end_ns);
         }
         break;
+    case RWBLE_AES_CTRL:
+        /*
+         * The start bit is self-clearing; the block runs synchronously and
+         * signals completion through RWBLE IRQ status bit 4.
+         */
+        s->rwbt[off / 4] = 0;
+        if (v & 1u) {
+            esp32_bt_ble_aes_start(s);
+        }
+        break;
     case RWBLE_IRQ_CLEAR:
         s->rwble_irq_status &= ~v;
         s->rwbt[off / 4] = v;
@@ -3668,6 +3803,9 @@ static Property esp32_bt_properties[] = {
      */
     DEFINE_PROP_BOOL("bb-ea-timer", Esp32BtState, bb_ea_model, false),
     /* Opt-in KE timer comparator (RWBT 0x0b4 / 0x00c bit 10 -> status bit 10). */
+    DEFINE_PROP_BOOL("bb-ble-aes", Esp32BtState, bb_ble_aes, false),
+    DEFINE_PROP_UINT32("bb-ble-aes-em-base", Esp32BtState,
+                       bb_ble_aes_em_base, 0x3ffb0000),
     DEFINE_PROP_BOOL("bb-ke-timer", Esp32BtState, bb_ke_timer, false),
     /* Optional task/id filter for the modelled KE timer. */
     DEFINE_PROP_UINT32("bb-ke-env-addr", Esp32BtState, bb_ke_env_addr, 0),
@@ -3820,6 +3958,10 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_peer_len, 0),
     DEFINE_PROP_STRING("bb-ble-evt-peer-payload", Esp32BtState,
                        bb_ble_evt_peer_payload),
+    DEFINE_PROP_STRING("bb-ble-evt-peer-payloads", Esp32BtState,
+                       bb_ble_evt_peer_payloads),
+    DEFINE_PROP_BOOL("bb-ble-evt-peer-after-tx", Esp32BtState,
+                     bb_ble_evt_peer_after_tx, false),
     DEFINE_PROP_UINT64("bb-ble-evt-peer-delay-ns", Esp32BtState,
                        bb_ble_evt_peer_delay_ns, 400000),
     DEFINE_PROP_UINT32("bb-ble-evt-rx-desc-base", Esp32BtState,
