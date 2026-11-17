@@ -432,6 +432,16 @@ typedef struct Esp32BtState {
     uint32_t bb_ble_evt_peer_limit;
     uint32_t bb_ble_evt_peer_posted;
     /*
+     * Data-event continuation (opt-in bb-ble-evt-continue).  The default
+     * stops watching after the event that carried a PDU, so a procedure that
+     * spans two connection events (LL_ENC_REQ in one, LL_START_ENC_REQ in the
+     * next) is only observed up to its first transmission.  With this count
+     * non-zero the model keeps watching until that many data-carrying events
+     * have run through the controller.
+     */
+    uint32_t bb_ble_evt_continue;
+    uint32_t bb_ble_evt_data_events;
+    /*
      * Reply only after the controller transmitted a PDU in this event
      * (opt-in bb-ble-evt-peer-after-tx).  The encrypted-link procedure needs
      * it: the peer's LL_ENC_RSP must follow the controller's LL_ENC_REQ, not

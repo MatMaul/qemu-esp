@@ -2543,7 +2543,9 @@ static void esp32_bt_ble_evt_end(void *opaque)
     /*
      * An empty connection event only burns the next interval: keep the model
      * watching so the following event, which may carry the queued ACL PDU,
-     * runs through the controller as well.  Stop after a data event.
+     * runs through the controller as well.  A data event normally stops the
+     * model, unless bb-ble-evt-continue asks for more of them: an LL control
+     * procedure such as the encryption start spans several events.
      */
     s->bb_ble_evt_started = false;
     s->bb_ble_evt_end_armed = false;
@@ -2553,7 +2555,11 @@ static void esp32_bt_ble_evt_end(void *opaque)
     s->bb_ble_evt_window_slots = 0;
     s->bb_ble_evt_window_count = 0;
     if (s->bb_ble_evt_tx != 0 || tx != 0) {
-        s->bb_ble_evt_fired = true;
+        s->bb_ble_evt_data_events++;
+        if (s->bb_ble_evt_continue == 0 ||
+            s->bb_ble_evt_data_events >= s->bb_ble_evt_continue) {
+            s->bb_ble_evt_fired = true;
+        }
     }
     s->bb_ble_evt_tx = 0;
     if (!s->bb_ble_evt_fired && s->bb_ble_evt_ctrl_start) {
@@ -3581,6 +3587,7 @@ static void esp32_bt_reset(DeviceState *dev)
     s->bb_ble_evt_armed = false;
     s->bb_ble_evt_fired = false;
     s->bb_ble_evt_events = 0;
+    s->bb_ble_evt_data_events = 0;
     s->bb_ble_evt_init_elt = 0;
     s->bb_ble_con_pending = false;
     s->bb_ble_evt_parked = false;
@@ -3976,6 +3983,8 @@ static Property esp32_bt_properties[] = {
                        bb_ble_evt_rx_buf_field, 0x08),
     DEFINE_PROP_UINT32("bb-ble-evt-peer-limit", Esp32BtState,
                        bb_ble_evt_peer_limit, 0),
+    DEFINE_PROP_UINT32("bb-ble-evt-continue", Esp32BtState,
+                       bb_ble_evt_continue, 0),
     DEFINE_PROP_UINT32("bb-ble-evt-end-state", Esp32BtState,
                        bb_ble_evt_end_state, 0),
     DEFINE_PROP_UINT32("bb-ble-evt-end-status-bit", Esp32BtState,
