@@ -43,12 +43,18 @@ void log_mmio_access(uint32_t address, uint32_t value, bool access_is_write) {
     }
     // Logs the address, value read or written and stacktrace to a file
     if (!functiontrace_fd) {
-        // This file is in /tmp, since it needs to log quickly
+        // Logged in $TMPDIR (default /tmp) because the trace is written at
+        // singlestep rate and must not pay for a slow filesystem.  The harness
+        // points TMPDIR at a scratch volume; /tmp is often a small overlay.
+        const char *tmpdir = getenv("TMPDIR");
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/qemu_mmio_execution_trace.ndjson",
+                 (tmpdir && *tmpdir) ? tmpdir : "/tmp");
         // We never fclose the file, but it's fine; in C, the exit function is guaranteed
         //  to fclose all opened files (it even flushes the unwritten buffered data, if any )
-        functiontrace_fd = fopen("/tmp/qemu_mmio_execution_trace.ndjson", "wb");
+        functiontrace_fd = fopen(path, "wb");
         if (!functiontrace_fd) {
-            printf("Could not open mmio trace file\n");
+            printf("Could not open mmio trace file %s\n", path);
             exit(23);
         }
     }

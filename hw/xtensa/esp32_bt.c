@@ -1509,6 +1509,61 @@ static void esp32_bt_rx_inject_arm(Esp32BtState *s)
 }
 
 /*
+ * Program the per-activity packet type the ACL frame-manager validates.
+ *
+ * Every software writer of the record at `base + stride*activity` preserves the
+ * low five bits (`extui ...,0,5` before OR-ing its own flags): r_ld_acl_start
+ * at 0x400351d3, ld_acl_evt_start_cbk at 0x40030c3c, ld_acl_clk_isr at
+ * 0x40030e31 and the sniff/rsw arms.  Only ld_page_em_init and
+ * ld_pscan_em_init write the field, and only for their own activities, so for
+ * an ACL link the field can only be filled by the baseband.  r_ld_fm_prog_push
+ * rejects an activity whose type is 0 (ASSERT_ERR(0), ld_fm.c:1055), so a
+ * CPU-only capture can never reach the frame-end path without this write.
+ *
+ * The type cannot be invented: it is what the link driver put in the TX record
+ * it posted (`+0x02` bits 6:3, spec/04 §3.2b), which is the same value the
+ * baseband would transmit.  bb-act-record-type overrides it for experiments;
+ * when 0 the type is read back from the guest's own record, so the model copies
+ * a decision the software already made rather than supplying one.
+ */
+static void esp32_bt_act_record_stamp(Esp32BtState *s)
+{
+    uint32_t idx, act, addr, word, type;
+
+    if (s->bb_act_record_base == 0 || s->bb_act_record_stride == 0 ||
+        s->bb_tx_record_base == 0) {
+        return;
+    }
+
+    /* The TX block index is 2*link_id + queue, and link_id is the activity. */
+    idx = (s->bb_tx_watch_addr - s->bb_tx_record_base) / s->bb_tx_queue_stride;
+    act = idx / 2;
+
+    type = s->bb_act_record_type;
+    if (type == 0) {
+        address_space_read(&address_space_memory,
+                           s->bb_tx_watch_addr + 2, MEMTXATTRS_UNSPECIFIED,
+                           &word, sizeof(word));
+        type = (word >> 3) & 0x1fu;
+    }
+    if (type == 0) {
+        return;
+    }
+
+    addr = s->bb_act_record_base + s->bb_act_record_stride * act;
+    address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                       &word, sizeof(word));
+    word = (word & ~0x1fu) | type;
+    address_space_write(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                        &word, sizeof(word));
+
+    ESP32_BT_LOG(s,
+                  "esp32_bt: act record n=%u addr=%08x activity=%u "
+                  "type=%u word=%08x\n",
+                  s->bb_tx_completions, addr, act, type, word);
+}
+
+/*
  * Opt-in baseband TX completion model.
  *
  * The BR/EDR TX control block is an array of 10-byte records at EM 0x23ba,
@@ -1556,6 +1611,8 @@ static void esp32_bt_tx_complete(void *opaque)
                   s->bb_tx_owner_bit, before, after,
                   s->bb_tx_rwble ? s->rwble_irq_status : s->rwbt_irq_status,
                   s->bb_tx_rwble ? "RWBLE" : "RWBT");
+
+    esp32_bt_act_record_stamp(s);
     esp32_bt_update_irqs(s);
 }
 
@@ -3866,6 +3923,27 @@ static Property esp32_bt_properties[] = {
                        bb_tx_poll_ns, 200000),
     DEFINE_PROP_UINT64("bb-tx-delay-ns", Esp32BtState,
                        bb_tx_delay_ns, 1000000),
+
+    /*
+     * Packet-type stamp on TX completion.  Disabled by default (type 0).  The
+     * per-activity baseband record at bb-act-record-base (stride
+     * bb-act-record-stride, i.e. spec/04's `102 * activity`) carries the 5-bit
+     * packet type the ACL frame manager validates.  No ACL software path writes
+     * those bits, so the field is baseband-owned; this model programs it on the
+     * same completion that clears the owner bit.  bb-tx-link-off and
+     * bb-tx-record-base and bb-tx-queue-stride locate the posted record so its
+     * activity: the TX block index is `2 * link_id + queue`.
+     */
+    DEFINE_PROP_UINT32("bb-act-record-base", Esp32BtState,
+                       bb_act_record_base, 0),
+    DEFINE_PROP_UINT32("bb-act-record-stride", Esp32BtState,
+                       bb_act_record_stride, 0),
+    DEFINE_PROP_UINT32("bb-act-record-type", Esp32BtState,
+                       bb_act_record_type, 0),
+    DEFINE_PROP_UINT32("bb-tx-record-base", Esp32BtState,
+                       bb_tx_record_base, 0),
+    DEFINE_PROP_UINT32("bb-tx-queue-stride", Esp32BtState,
+                       bb_tx_queue_stride, 10),
 
     /*
      * Opt-in BLE connection-event model.  Disabled by default.  It watches the

@@ -327,6 +327,22 @@ typedef struct Esp32BtState {
     bool bb_tx_rwble;
     uint64_t bb_tx_poll_ns;
     uint64_t bb_tx_delay_ns;
+    /*
+     * Packet-type stamp on TX completion.  The per-activity baseband record at
+     * `bb-act-record-base + bb-act-record-stride*activity` carries a 5-bit
+     * packet type in its low bits, and every software writer preserves those
+     * bits (`extui ...,0,5` before OR-ing its own flags), so the field is
+     * baseband-owned.  r_ld_fm_prog_push() refuses an activity whose type is 0
+     * (`ASSERT_ERR(0)`, ld_fm.c:1055).  When bb-act-record-type is non-zero,
+     * the completion write-back programs that field for the activity the TX
+     * record belongs to, which is the only way the field can ever be set in a
+     * CPU-only capture.
+     */
+    uint32_t bb_act_record_base;
+    uint32_t bb_act_record_stride;
+    uint32_t bb_act_record_type;
+    uint32_t bb_tx_record_base;
+    uint32_t bb_tx_queue_stride;
     bool bb_tx_watch_armed;
     bool bb_tx_armed;
     bool bb_tx_fired;
